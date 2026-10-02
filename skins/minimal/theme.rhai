@@ -1,0 +1,66 @@
+// disktree-rhai default theme — Tokyo Night based, matching tobi/disktree's
+// dark fallback (Tokyo Night) with disktree's zero-radius Omarchy-style scale.
+// Category palette constants live in core.rhai; they derive fills from these
+// surface/accent tokens at render time.
+fn theme() {
+    #{
+        family: "Disktree",
+        name: "Minimal Gray",
+        mode: "dark",
+        tokens: #{
+            colors: #{
+                surface: 0x16161aff,
+                surface_raised: 0x1e1e22ff,
+                surface_hover: 0x242428ff,
+                text_primary: 0xd4d4d8ff,
+                text_muted: 0x8a8a94ff,
+                accent: 0xa1a1aaff,
+                accent_hover: 0xb4b4bcff,
+                on_accent: 0x1a1b26ff,
+                danger: 0xf7768eff,
+                on_danger: 0x1a1b26ff,
+                warning: 0xe0af68ff,
+                on_warning: 0x1a1b26ff,
+                success: 0x9ece6aff,
+                on_success: 0x1a1b26ff,
+                border: 0x2a2a30ff,
+                focus_ring: 0x7dcfffff,
+                selection: 0x292e42ff,
+                disabled: 0x565f89ff,
+                scrim: 0x10121bcc,
+            },
+            spacing: #{
+                xxs: #{ unit: "pixels", value: 2.0 },
+                xs: #{ unit: "pixels", value: 4.0 },
+                sm: #{ unit: "pixels", value: 8.0 },
+                md: #{ unit: "pixels", value: 12.0 },
+                lg: #{ unit: "pixels", value: 16.0 },
+            },
+            radii: #{
+                sm: #{ unit: "pixels", value: 0.0 },
+                md: #{ unit: "pixels", value: 0.0 },
+                lg: #{ unit: "pixels", value: 0.0 },
+            },
+            typography: #{
+                roles: #{
+                    caption: #{ size: #{ unit: "pixels", value: 11.0 },
+                        line_height: #{ unit: "pixels", value: 16.0 }, weight: 400 },
+                    body_small: #{ size: #{ unit: "pixels", value: 12.0 },
+                        line_height: #{ unit: "pixels", value: 16.0 }, weight: 400 },
+                    body: #{ size: #{ unit: "pixels", value: 13.0 },
+                        line_height: #{ unit: "pixels", value: 18.0 }, weight: 400 },
+                    subtitle: #{ size: #{ unit: "pixels", value: 14.0 },
+                        line_height: #{ unit: "pixels", value: 20.0 }, weight: 400 },
+                    title: #{ size: #{ unit: "pixels", value: 16.0 },
+                        line_height: #{ unit: "pixels", value: 22.0 }, weight: 700 },
+                    heading: #{ size: #{ unit: "pixels", value: 18.0 },
+                        line_height: #{ unit: "pixels", value: 24.0 }, weight: 700 },
+                    display: #{ size: #{ unit: "pixels", value: 24.0 },
+                        line_height: #{ unit: "pixels", value: 32.0 }, weight: 700 },
+                    display_large: #{ size: #{ unit: "pixels", value: 28.0 },
+                        line_height: #{ unit: "pixels", value: 36.0 }, weight: 700 },
+                },
+            },
+        },
+    }
+}
