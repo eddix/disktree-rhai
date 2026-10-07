@@ -431,6 +431,11 @@ fn run_window(prepared: gpui_rhai::PreparedScriptView) -> Result<(), gpui_rhai::
                 );
                 match mounted {
                     Ok(view) => {
+                        // The host owns this window; register it so the
+                        // skin's window commands (q → close_window) resolve.
+                        if let Err(error) = view.register_native_window("main", window, cx) {
+                            eprintln!("disktree-rhai: register window: {error}");
+                        }
                         let _ = view.focus(window, cx);
                         let _ = weak.update(cx, |shell, cx| {
                             shell.view = Some(view);

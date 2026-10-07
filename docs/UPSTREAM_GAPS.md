@@ -135,15 +135,14 @@ around locally, or accepted).
   1. `ScriptViewHost::new` hardcodes `WindowCommandPolicy::Disabled` and the
      policy-taking constructor was crate-private — fixed upstream by **PR
      #100** (`host-window-policy`, branch pushed, awaiting review).
-  2. With the policy enabled, `ctx.close_window("main")` still fails with
+  2. With the policy enabled, `ctx.close_window("main")` still failed with
      `native window main is unavailable`: `PreparedScriptView::mount`
-     (the public mount) builds a private, empty native-window registry, so
-     a manually mounted view has no way to register the host's OS window.
-     `ScriptApplication::run` does this internally via the likewise private
-     `mount_with_registry`. **Open**: expose native-window registration
-     (or a public `mount_with_registry`) for hosts that own the window.
-     Local workaround pending; `q` currently reports this error instead of
-     quitting — close the window with the WM until fixed.
+     builds a private, empty native-window registry. Fixed upstream by
+     **PR #103** (`register-native-window`) —
+     `ScriptViewHandle::register_native_window(id, window, cx)`, one call
+     after mount. disktree-rhai registers in its mount callback; `q`
+     now closes the window (blind-tested: focus via Hyprland's new lua
+     dispatch API, keypress, process-exit check, zero script errors).
 
 ## G9 — rhai data-size limits are cumulative and not host-configurable
 
