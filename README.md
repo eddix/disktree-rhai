@@ -88,8 +88,9 @@ checked out as a sibling directory (`../gpui-rhai`) on branch
 `disktree-integration` until upstream PRs
 [#96](https://github.com/eddix/gpui-rhai/pull/96),
 [#97](https://github.com/eddix/gpui-rhai/pull/97),
-[#99](https://github.com/eddix/gpui-rhai/pull/99) and
-[#100](https://github.com/eddix/gpui-rhai/pull/100) merge:
+[#99](https://github.com/eddix/gpui-rhai/pull/99),
+[#100](https://github.com/eddix/gpui-rhai/pull/100) and
+[#103](https://github.com/eddix/gpui-rhai/pull/103) merge:
 
 ```sh
 git clone https://github.com/eddix/gpui-rhai ../gpui-rhai
