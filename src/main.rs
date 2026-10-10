@@ -5,10 +5,8 @@
 //! is the default skin embedded from `ui/`, which users can export, modify,
 //! and load back.
 
-mod embedded;
-
-
 use disktree_rhai::capability::DisktreeExtension;
+use disktree_rhai::embedded;
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext, IntoElement, ParentElement};
@@ -100,8 +98,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 args.skin = Some(iter.next().ok_or("--skin needs a name or path")?.to_owned());
             }
             "--skin-dev" => {
-                args.skin_dev =
-                    Some(iter.next().ok_or("--skin-dev needs a path")?.to_owned());
+                args.skin_dev = Some(iter.next().ok_or("--skin-dev needs a path")?.to_owned());
             }
             "--export-skin" => {
                 // Optional value: only swallow the next argv if it doesn't look
@@ -212,19 +209,26 @@ fn export_skin(name: &str) -> Result<(), String> {
             target.display()
         ));
     }
-    std::fs::create_dir_all(&target).map_err(|error| format!("create {}: {error}", target.display()))?;
+    std::fs::create_dir_all(&target)
+        .map_err(|error| format!("create {}: {error}", target.display()))?;
     for (file, contents) in embedded::SKIN_FILES {
         let path = target.join(file);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("create {}: {error}", parent.display()))?;
         }
-        std::fs::write(&path, contents).map_err(|error| format!("write {}: {error}", path.display()))?;
+        std::fs::write(&path, contents)
+            .map_err(|error| format!("write {}: {error}", path.display()))?;
     }
     println!("Exported the built-in skin to {}", target.display());
     println!("Edit it, then run: disktree-rhai --skin {}", name);
     Ok(())
 }
+
+/// The runtime's expression-depth defaults (64 global / 32 per function) are
+/// below what this skin's deeply nested view functions need; 128 per function
+/// covers the deepest chrome paths with headroom.
+const EXPRESSION_DEPTH_LIMITS: (usize, usize) = (64, 128);
 
 fn prepare_view(args: &Args) -> Result<PreparedScriptView, gpui_rhai::ScriptViewError> {
     // The scan root: the path the user gave, or home, canonicalized like
@@ -234,11 +238,9 @@ fn prepare_view(args: &Args) -> Result<PreparedScriptView, gpui_rhai::ScriptView
         .clone()
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .and_then(|path| path.canonicalize().ok().map(PathBuf::from))
-        .ok_or_else(|| {
-            gpui_rhai::ScriptViewError::Io {
-                path: PathBuf::from("<home>"),
-                source: std::io::Error::other("no path given and no home directory"),
-            }
+        .ok_or_else(|| gpui_rhai::ScriptViewError::Io {
+            path: PathBuf::from("<home>"),
+            source: std::io::Error::other("no path given and no home directory"),
         })?;
     let metric = args.metric.clone().unwrap_or_else(|| "size".to_owned());
     let theme_mode = resolve_theme_mode(&args.theme).to_owned();
@@ -283,33 +285,51 @@ fn prepare_view(args: &Args) -> Result<PreparedScriptView, gpui_rhai::ScriptView
         let entry = Path::new("ui").join("main.rhai");
         return FileScriptView::new(entry)
             .development(true)
+            .viewport_breakpoints(gpui_rhai::ViewportBreakpoints::new(832.0, 1280.0).expect("valid breakpoints"))
             .extension(extension())
             .operation_limit(SCRIPT_OPERATION_BUDGET)
+            .expression_depth_limits(EXPRESSION_DEPTH_LIMITS.0, EXPRESSION_DEPTH_LIMITS.1)
             .key_binding(history_bindings[0].clone())
             .key_binding(history_bindings[1].clone())
             .prepare();
     }
     if let Some(spec) = args.skin_dev.as_ref().or(args.skin.as_ref()) {
-        let skin_dir = resolve_skin(spec).map_err(|error| {
-            gpui_rhai::ScriptViewError::Io {
-                path: spec.clone().into(),
-                source: std::io::Error::other(error),
-            }
+        let skin_dir = resolve_skin(spec).map_err(|error| gpui_rhai::ScriptViewError::Io {
+            path: spec.clone().into(),
+            source: std::io::Error::other(error),
         })?;
         let hot = args.skin_dev.is_some();
+        // A file skin brings its own tokens.rhai and assets/ beside main.rhai;
+        // the host picks both up automatically.
         return FileScriptView::new(skin_dir.join("main.rhai"))
             .development(hot)
+            .viewport_breakpoints(gpui_rhai::ViewportBreakpoints::new(832.0, 1280.0).expect("valid breakpoints"))
             .extension(extension())
             .operation_limit(SCRIPT_OPERATION_BUDGET)
+            .expression_depth_limits(EXPRESSION_DEPTH_LIMITS.0, EXPRESSION_DEPTH_LIMITS.1)
             .key_binding(history_bindings[0].clone())
             .key_binding(history_bindings[1].clone())
             .prepare();
     }
+    let mut theme_sources = vec![(
+        "themes/flexoki_light.rhai".to_owned(),
+        embedded::FLEXOKI_LIGHT.to_owned(),
+    )];
+    theme_sources.extend(
+        embedded::bundled_palette_sources()
+            .into_iter()
+            .map(|(name, source)| (name, source.to_owned())),
+    );
     EmbeddedScriptView::new(embedded::entry(), embedded::sources(), embedded::THEME)
-        .theme_sources([("themes/flexoki_light.rhai".to_owned(), embedded::FLEXOKI_LIGHT.to_owned())])
+        .viewport_breakpoints(gpui_rhai::ViewportBreakpoints::new(832.0, 1280.0).expect("valid breakpoints"))
+        .token_base(gpui_rhai_registry::TOKEN_BASE_SOURCE)
+        .locale_sources([("en".to_owned(), embedded::EN_LOCALE.to_owned())])
+        .theme_sources(theme_sources)
+        .asset_sources(embedded::assets())
         .manifest(embedded::manifest())
         .extension(extension())
         .operation_limit(SCRIPT_OPERATION_BUDGET)
+        .expression_depth_limits(EXPRESSION_DEPTH_LIMITS.0, EXPRESSION_DEPTH_LIMITS.1)
         .key_binding(history_bindings[0].clone())
         .key_binding(history_bindings[1].clone())
         .prepare()
@@ -381,13 +401,10 @@ impl gpui::Render for Shell {
 fn run_window(prepared: gpui_rhai::PreparedScriptView) -> Result<(), gpui_rhai::ScriptViewError> {
     gpui_platform::application().run(move |cx: &mut gpui::App| {
         gpui_rhai::install(cx);
-        // This host owns the window and mounts the view itself, so the
-        // embedded view gets window commands (the skin's `q` closes it).
-        let host = match gpui_rhai::ScriptViewHost::new_with_policy(
-            "main",
-            gpui_rhai::WindowCommandPolicy::ApplicationOwned,
-            cx,
-        ) {
+        // This host owns the window and mounts the view itself. 0.2 folds the
+        // old new_with_policy(ApplicationOwned) into `new`: a host-created
+        // window is application-owned, so the skin's `q` still closes it.
+        let host = match gpui_rhai::ScriptViewHost::new("main", cx) {
             Ok(host) => host,
             Err(error) => {
                 eprintln!("disktree-rhai: {error}");
@@ -413,10 +430,20 @@ fn run_window(prepared: gpui_rhai::PreparedScriptView) -> Result<(), gpui_rhai::
             origin: gpui::Point::new(gpui::px(120.0), gpui::px(90.0)),
             size: gpui::size(gpui::px(1440.0), gpui::px(900.0)),
         }));
+        // The skin draws its own title bar (the official TitleBar component,
+        // with window dragging). A transparent-appearing titlebar keeps the
+        // full-size content view AND the traffic lights overlaid —
+        // `titlebar: None` drops the closable/minimizable masks and with
+        // them the buttons entirely.
         options.titlebar = Some(gpui::TitlebarOptions {
-            title: Some("disktree-rhai".into()),
+            title: None,
+            appears_transparent: true,
             ..gpui::TitlebarOptions::default()
         });
+        // The bar's drag areas move the window through the runtime's
+        // start_window_move; AppKit must not also drag or delay titlebar
+        // clicks disambiguating double-presses.
+        options.app_owns_titlebar_drag = true;
         options.window_min_size = Some(gpui::size(gpui::px(900.0), gpui::px(600.0)));
         let opened = cx.open_window(options, |window, cx| {
             let root = shell.clone();
@@ -424,7 +451,11 @@ fn run_window(prepared: gpui_rhai::PreparedScriptView) -> Result<(), gpui_rhai::
             let host = host.clone();
             window.defer(cx, move |window, cx| {
                 let mounted = prepared.mount(
-                    gpui_rhai::ScriptViewConfig::new("main").paint_background(true),
+                    gpui_rhai::ScriptViewConfig::new("main")
+                        .paint_background(true)
+                        // The skin draws its own TitleBar; its background
+                        // drags the window (and double-press zooms it).
+                        .window_drag_areas(true),
                     host,
                     window,
                     cx,

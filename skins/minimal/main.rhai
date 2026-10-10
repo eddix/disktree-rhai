@@ -7,7 +7,15 @@
 // primitives tobi uses — descend/ascend, geometric neighbour movement,
 // ranked sibling cycling, anchored zoom that enters a directory at its
 // ceiling and ascends at the floor, history on alt-arrows and side buttons.
-import "components/widgets" as w;
+// The minimal skin keeps its chrome on the official 0.2 component set
+// (runtime API 3) — button, progress, spinner, keycaps and the stat pattern —
+// while the mosaic stays bespoke canvas and the controls stay keyboard-only.
+import "components/button" as button;
+import "components/kbd" as kbd;
+import "components/progress" as progress;
+import "components/spinner" as spinner;
+import "components/status_bar" as status_bar;
+import "patterns/stat" as stat;
 import "core" as core;
 
 // ---------------------------------------------------------------------------
@@ -18,13 +26,17 @@ define_component(#{
     metadata: #{
         id: "skin/scan_root",
         "export": "ScanRoot",
-        version: "0.3.0",
-        runtime_api: #{ min_inclusive: 2, max_exclusive: 3 },
-        dependencies: ["skin/button"],
+        version: "0.4.0",
+        runtime_api: #{ min_inclusive: 3, max_exclusive: 4 },
+        dependencies: [
+            "components/button", "components/kbd", "components/progress",
+            "components/spinner", "components/status_bar", "patterns/stat",
+        ],
         capabilities: #{
             "disktree.scan": "*",
             "disktree.tree": "*",
             "disktree.open": "*",
+            "disktree.git": "*",
             "disktree.args": "*",
         },
     },
@@ -124,7 +136,7 @@ fn scan_start(ctx, deps) {
         now: 0,
     });
     // A fresh scan invalidates the mosaic until it lands.
-    ctx.set_app_store("disktree", "layout", empty_layout());
+    reset_derived_layout(ctx);
     ctx.set_app_store(
         "disktree",
         "cursor",
@@ -169,7 +181,7 @@ fn scan_on_next(ctx, event) {
         scan.now = event.now;
         // A new tree invalidates the navigation crumbs and the mosaic, but
         // history survives: entries resolve lazily and prune themselves.
-        ctx.set_app_store("disktree", "layout", empty_layout());
+        reset_derived_layout(ctx);
         ctx.set_app_store("disktree", "scan", scan);
         return ();
     }
@@ -247,18 +259,46 @@ fn tile_lookup(layout, key) {
 /// the render projects each row through the view. Rows are plain data
 /// (the store cannot hold command objects); labels cache area-sorted
 /// candidate indices.
-fn build_paint(ctx, tiles, mode) {
+fn build_paint(ctx, tiles, mode, root_crumbs) {
     let light = is_light(ctx);
     let scan = ctx.get_app_store("disktree", "scan");
+    // 过滤降淡：打字时引擎逐瓦片回答是否保持点亮；Enter 才落地过滤布局。
+    let needle = "";
+    if ctx.get_state("find_open") {
+        needle = ctx.get_state("find");
+    }
+    let out_keys = #{};
+    if needle.trim() != "" {
+        let i = 0;
+        while i < tiles.len() {
+            let tile = tiles[i];
+            let out = true;
+            if tile.kind != "others" {
+                let reply = ctx.call_capability("disktree.tree", "kept", #{
+                    base: root_crumbs,
+                    needle: needle,
+                    crumbs: tile.crumbs,
+                });
+                if reply != "out" {
+                    out = false;
+                }
+            }
+            if out {
+                out_keys[tile_key(tile)] = true;
+            }
+            i += 1;
+        }
+    }
     let base = [];
     let i = 0;
     while i < tiles.len() {
-        base = base + tile_base_commands(tiles[i], mode, light, scan.now);
+        base = base + tile_base_commands(tiles[i], mode, light, scan.now, out_keys);
         i += 1;
     }
     #{
         base: base,
         labels: sorted_label_candidates(tiles),
+        out_keys: out_keys,
     }
 }
 
@@ -305,11 +345,95 @@ fn empty_layout() {
         focused: false,
         filter: "",
         find_summary: (),
-        cache: [],
         by_key: #{},
         gen: 0,
-        paint_by_mode: #{ "0": (), "1": (), "2": () },
+        anim: anim_idle(),
     }
+}
+
+/// The paint slots and the one-slot tile cache live in their own app-store
+/// values, not inside the layout: rhai's array limit counts nested array
+/// elements cumulatively per store VALUE (docs/UPSTREAM_GAPS.md G9), and
+/// tiles + their crumb arrays + a cache slot + paint rows in one value
+/// crosses 10k on real trees. Reset together with the layout on every fresh
+/// scan.
+fn reset_derived_layout(ctx) {
+    ctx.set_app_store("disktree", "layout", empty_layout());
+    ctx.set_app_store("disktree", "paint0", ());
+    ctx.set_app_store("disktree", "paint1", ());
+    ctx.set_app_store("disktree", "paint2", ());
+    ctx.set_app_store("disktree", "cache", []);
+}
+
+/// The idle animation state.
+fn anim_idle() {
+    #{ active: false, from: core::view_identity(), step: 0, steps: 0 }
+}
+
+/// The view that makes `body` fill the viewport, centred on its middle:
+/// where a grown-into-place navigation starts (or ends, reversed).
+fn zoom_start(body, width, height) {
+    let scale = core::view_fit_scale(body, width, height);
+    if scale <= 1.05 {
+        return ();
+    }
+    #{
+        scale: scale,
+        ox: body.x + body.w / 2.0 - (width / 2.0) / scale,
+        oy: body.y + body.h / 2.0 - (height / 2.0) / scale,
+    }
+}
+
+/// Ease-out cubic for the zoom steps.
+fn anim_ease(t) {
+    let inv = 1.0 - t;
+    1.0 - inv * inv * inv
+}
+
+/// One view on the way from `from` to identity at fraction `t`.
+fn view_lerp(from, t) {
+    #{
+        scale: from.scale + (1.0 - from.scale) * t,
+        ox: from.ox * (1.0 - t),
+        oy: from.oy * (1.0 - t),
+    }
+}
+
+/// One 16ms step of a navigation transition: the view eases from the
+/// zoomed start toward identity, and the last step lands exactly on it.
+fn anim_tick(ctx, step) {
+    let layout = ctx.get_app_store("disktree", "layout");
+    let anim = layout.anim;
+    if !anim.active {
+        return ();
+    }
+    let next = step + 1;
+    if next >= anim.steps {
+        layout.view = core::view_identity();
+        layout.anim = anim_idle();
+        ctx.set_app_store("disktree", "layout", layout);
+        return ();
+    }
+    layout.view = view_lerp(anim.from, anim_ease(next.to_float() / anim.steps.to_float()));
+    anim.step = next;
+    layout.anim = anim;
+    ctx.set_app_store("disktree", "layout", layout);
+}
+
+/// A gesture (wheel, zoom keys) takes the view back: stop any transition.
+fn cancel_anim(ctx, layout) {
+    if layout.anim.active {
+        layout.anim = anim_idle();
+        ctx.set_app_store("disktree", "layout", layout);
+    }
+}
+
+
+/// Empty the three paint slots (own store values, see reset_derived_layout).
+fn reset_paint(ctx) {
+    ctx.set_app_store("disktree", "paint0", ());
+    ctx.set_app_store("disktree", "paint1", ());
+    ctx.set_app_store("disktree", "paint2", ());
 }
 
 // -- layout -------------------------------------------------------------------
@@ -332,9 +456,12 @@ fn layout_recompute(ctx, deps) {
     // 参数化缓存：同一 (metric, depth, crumbs, size, filter) 的往返切换
     // （t 循环、[/] 试深度）直接复用瓦片，重算只发生在真正新参数上。
     let cache_key = `${deps[2]}:${deps[3]}:${deps[1]}:${deps[4].to_int()}x${deps[5].to_int()}:${deps[6]}`;
+    // The one cache slot lives in its own store value (G9: array budgets are
+    // cumulative per store value).
+    let previous_cache = ctx.get_app_store("disktree", "cache");
     let cached = ();
     let kept_cache = [];
-    for slot in previous.cache {
+    for slot in previous_cache {
         if slot[0] == cache_key {
             cached = slot;
         } else {
@@ -346,17 +473,14 @@ fn layout_recompute(ctx, deps) {
         layout.tiles = cached[1];
         layout.by_key = cached[2];
         layout.gen += 1;
+        layout.valid = true;
+        layout.anim = anim_idle();
+        ctx.set_app_store("disktree", "layout", layout);
         // A restored layout invalidates every paint; rebuild the one the
         // user is actually looking at, or the next render is blank.
         let mode_now = ctx.get_state("mode");
-        layout.paint_by_mode = #{
-            "0": (),
-            "1": (),
-            "2": (),
-        };
-        layout.paint_by_mode[`${mode_now}`] = build_paint(ctx, layout.tiles, mode_now);
-        layout.valid = true;
-        ctx.set_app_store("disktree", "layout", layout);
+        reset_paint(ctx);
+        ctx.set_app_store("disktree", `paint${mode_now}`, build_paint(ctx, layout.tiles, mode_now, layout.crumbs));
         return ();
     }
     let crumbs = [];
@@ -370,6 +494,28 @@ fn layout_recompute(ctx, deps) {
         crumbs = previous.crumbs;
         view = previous.view;
     }
+    // Entering a directory: the transition starts zoomed on its tile in
+    // the old mosaic, so the new contents grow into place.
+    let anim_from = ();
+    if previous.valid && previous.crumbs.len() < crumbs.len()
+        && core::crumb_starts_with(crumbs, previous.crumbs)
+    {
+        let entered = tile_lookup(previous, crumb_key(crumbs));
+        if entered != () {
+            anim_from = zoom_start(core::tile_body(entered), width, height);
+        }
+    }
+    // The tile budget scales with the crumb depth: each tile carries its own
+    // crumb array, and rhai's array limit counts them cumulatively (G9), so
+    // a deep current directory earns fewer tiles.
+    let per_tile = crumbs.len() + deps[3] + 2;
+    let budget = 8500 / per_tile;
+    if budget > 2000 {
+        budget = 2000;
+    }
+    if budget < 250 {
+        budget = 250;
+    }
     let tiles = core::place_dir(
         ctx,
         crumbs,
@@ -378,7 +524,7 @@ fn layout_recompute(ctx, deps) {
         core::layout_options(deps[3]),
         0,
         deps[6],
-        2000
+        budget
     );
     let scan = ctx.get_app_store("disktree", "scan");
     let layout = empty_layout();
@@ -399,23 +545,39 @@ fn layout_recompute(ctx, deps) {
     layout.insights = insight_rows(ctx, scan.insights, deps[2]);
     layout.filter = filter;
     layout.find_summary = find_summary;
+    layout.by_key = tiles_by_key(tiles);
+    // Ascending: start zoomed on the directory just left, in the new
+    // mosaic, easing out to the whole view.
+    if anim_from == () && previous.valid && previous.crumbs.len() > crumbs.len()
+        && core::crumb_starts_with(previous.crumbs, crumbs)
+    {
+        let departed = tile_lookup(layout, crumb_key(previous.crumbs));
+        if departed != () {
+            anim_from = zoom_start(core::tile_body(departed), width, height);
+        }
+    }
+    if anim_from != () {
+        layout.view = anim_from;
+        let steps = ctx.motion_duration("normal") / 16;
+        if steps > 24 {
+            steps = 24;
+        }
+        if steps >= 2 {
+            layout.anim = #{ active: true, from: anim_from, step: 0, steps: steps };
+        }
+    }
     kept_cache.push([cache_key, tiles, layout.by_key]);
     while kept_cache.len() > 1 {
         kept_cache.remove(0);
     }
-    layout.cache = kept_cache;
-    layout.by_key = tiles_by_key(tiles);
+    ctx.set_app_store("disktree", "cache", kept_cache);
     layout.gen += 1;
     // Build the paint for the mode on screen, not always mode 0: a metric
     // switch re-runs this effect right after set_mode filled the new
     // mode's slot, and rebuilding only mode 0 would blank the mosaic.
     let mode_now = ctx.get_state("mode");
-    layout.paint_by_mode = #{
-        "0": (),
-        "1": (),
-        "2": (),
-    };
-    layout.paint_by_mode[`${mode_now}`] = build_paint(ctx, tiles, mode_now);
+    reset_paint(ctx);
+    ctx.set_app_store("disktree", `paint${mode_now}`, build_paint(ctx, tiles, mode_now, crumbs));
     if focused {
         layout.focused = true;
     } else {
@@ -786,6 +948,7 @@ fn zoom_at(ctx, x, y, factor, descend) {
     if !layout.valid {
         return ();
     }
+    layout.anim = anim_idle();
     let view = layout.view;
     if factor < 1.0 && view.scale <= 1.0 + 0.000001 {
         if descend {
@@ -837,6 +1000,7 @@ fn zoom_reset(ctx, payload) {
         return ();
     }
     layout.view = core::view_identity();
+    layout.anim = anim_idle();
     ctx.set_app_store("disktree", "layout", layout);
 }
 
@@ -925,6 +1089,8 @@ fn on_key(ctx, name) {
         ctx.set_state("sidebar_open", !open);
     } else if name == "o" {
         reveal_target(ctx);
+    } else if name == "e" {
+        cycle_theme(ctx);
     } else if name == "?" {
         ctx.set_state("help_open", true);
     } else if name == "q" {
@@ -965,11 +1131,10 @@ fn set_mode(ctx, mode) {
     // render never sees an empty slot.
     let layout = ctx.get_app_store("disktree", "layout");
     if layout.valid {
-        let slot = layout.paint_by_mode[`${mode}`];
+        let slot = ctx.get_app_store("disktree", `paint${mode}`);
         if slot == () {
-            layout.paint_by_mode[`${mode}`] = build_paint(ctx, layout.tiles, mode);
+            ctx.set_app_store("disktree", `paint${mode}`, build_paint(ctx, layout.tiles, mode, layout.crumbs));
         }
-        ctx.set_app_store("disktree", "layout", layout);
     }
     ctx.set_state("mode", mode);
     if mode == 1 {
@@ -1020,6 +1185,15 @@ fn reveal_failed(ctx, error) {
 fn find_refresh(ctx) {
     let find = ctx.get_state("find");
     let layout = ctx.get_app_store("disktree", "layout");
+    // 降淡跟着按键走：立即按当前 needle 重建屏幕上的 paint。
+    if layout.valid {
+        let mode_now = ctx.get_state("mode");
+        ctx.set_app_store(
+            "disktree",
+            `paint${mode_now}`,
+            build_paint(ctx, layout.tiles, mode_now, layout.crumbs)
+        );
+    }
     if find.trim() == "" || !layout.valid {
         layout.find_summary = ();
         ctx.set_app_store("disktree", "layout", layout);
@@ -1186,6 +1360,17 @@ fn on_pointer_down(ctx, event) {
         nav_history(ctx, false);
         return ();
     }
+    if button == "right" {
+        // 右键：在文件管理器中显示所指瓦片，同 tobi。
+        let layout = ctx.get_app_store("disktree", "layout");
+        if layout.valid && event.canvas_key != () {
+            let tile = tile_lookup(layout, key_tail(event.canvas_key));
+            if tile != () && tile.kind != "others" {
+                reveal_tile(ctx, tile.crumbs);
+            }
+        }
+        return ();
+    }
     if button != "left" {
         return ();
     }
@@ -1257,6 +1442,71 @@ fn on_wheel(ctx, event) {
     zoom_at(ctx, event.local.x, event.local.y, factor, true);
 }
 
+// -- themes ----------------------------------------------------------------------
+
+/// Every mounted palette: the skin's own two first, then gpui-rhai's
+/// bundled set. Entries are [family, name, label].
+fn theme_entries() {
+    [
+        ["Disktree", "Minimal Gray", "Minimal Gray"],
+        ["Disktree", "Flexoki Light", "Flexoki Light"],
+        ["Default", "Dark", "Default Dark"],
+        ["Default", "Light", "Default Light"],
+        ["Nord", "Dark", "Nord Dark"],
+        ["Gruvbox", "Dark", "Gruvbox Dark"],
+        ["Catppuccin", "Latte", "Catppuccin Latte"],
+        ["Catppuccin", "Mocha", "Catppuccin Mocha"],
+        ["Everforest", "Dark", "Everforest Dark"],
+        ["Tokyo Night", "Night", "Tokyo Night"],
+        ["Tokyo Night", "Storm", "Tokyo Storm"],
+        ["Aetheria", "Dark", "Aetheria Dark"],
+        ["Ethereal", "Dark", "Ethereal Dark"],
+        ["Futurism", "Dark", "Futurism Dark"],
+        ["Hackerman", "Dark", "Hackerman Dark"],
+        ["Hermarchy", "Dark", "Hermarchy Dark"],
+        ["Retro 82", "Dark", "Retro 82"],
+    ]
+}
+
+fn theme_key(family, name) {
+    `${family}::${name}`
+}
+
+/// A theme switch re-colours the mosaic: the paint rows carry resolved
+/// colours, so the on-screen mode's paint is rebuilt for the new palette.
+fn repaint_after_theme(ctx) {
+    let layout = ctx.get_app_store("disktree", "layout");
+    if layout.valid {
+        let mode_now = ctx.get_state("mode");
+        ctx.set_app_store(
+            "disktree",
+            `paint${mode_now}`,
+            build_paint(ctx, layout.tiles, mode_now, layout.crumbs)
+        );
+    }
+}
+
+/// `e`: the next palette, wrapping.
+fn cycle_theme(ctx) {
+    let variant = ctx.theme_variant();
+    let current = "";
+    if variant != () {
+        current = theme_key(variant.family, variant.name);
+    }
+    let entries = theme_entries_from(ctx);
+    let next = 0;
+    let i = 0;
+    while i < entries.len() {
+        if theme_key(entries[i].family, entries[i].name) == current {
+            next = (i + 1) % entries.len();
+        }
+        i += 1;
+    }
+    let pick = entries[next];
+    ctx.set_theme(pick.family, pick.name);
+    repaint_after_theme(ctx);
+}
+
 // -- toolbar actions -------------------------------------------------------------
 
 fn toggle_hidden(ctx, payload) {
@@ -1314,6 +1564,12 @@ fn open_clicked(ctx, crumbs) {
 }
 
 fn reveal_clicked(ctx, crumbs) {
+    reveal_tile(ctx, crumbs);
+}
+
+/// Reveal one crumb path in the file manager: the `o` key and a
+/// right-click on a tile share it.
+fn reveal_tile(ctx, crumbs) {
     if crumbs == () || crumbs.len() == 0 {
         return ();
     }
@@ -1367,11 +1623,20 @@ fn render_ScanRoot(ctx, props) {
         Fn("layout_stop")
     );
 
+    // A navigation transition steps itself: while one runs, redeclare the
+    // timer with the next step number (the changed payload re-arms it).
+    if layout.anim.active {
+        timeout("nav-anim", 16, false, Fn("anim_tick"), layout.anim.step);
+    }
+
     // The resolved variant drives the canvas palette; the read is a tracked
     // theme dependency, so a system appearance flip re-renders the mosaic.
     let light = is_light(ctx);
     // 极简皮肤没有侧栏：只有马赛克。
-    let with_side = stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light);
+    // The active mode's paint, from its own store value (G9). `()` until the
+    // layout effect fills it; mosaic_nodes renders an empty mosaic then.
+    let paint = ctx.get_app_store("disktree", `paint${mode}`);
+    let with_side = stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light, paint);
     let find = ctx.get_state("find");
     let body_rows = [header(metric, apparent, no_hidden, depth, mode, layout)];
     if find_open || layout.filter != "" {
@@ -1503,11 +1768,15 @@ fn header(metric, apparent, no_hidden, depth, mode, layout) {
                 .width(relative(1.0))
             ),
     ])
+    // 极简皮肤不用 TitleBar 组件,但窗口现在是全高内容视图:头部自己作为
+    // 拖拽区(inset 起点给 macOS 红绿灯留位)。
+    .window_drag_area()
     .with_style(
         style()
             .flex_col()
             .gap(px(8.0))
-            .padding_x(px(16.0))
+            .padding_start(px(78.0))
+            .padding_end(px(16.0))
             .padding_y(px(10.0))
             .border_bottom(px(1.0))
             .border_color(theme_color("border"))
@@ -1515,17 +1784,7 @@ fn header(metric, apparent, no_hidden, depth, mode, layout) {
 }
 
 fn history_button(label, enabled, handler) {
-    if enabled {
-        return w::Button(#{ label: label, variant: "ghost", on_click: handler });
-    }
-    box([text(label).with_style(
-        style()
-            .font_size(px(11.0))
-            .text_color(theme_color("text_muted"))
-            .padding_x(px(8.0))
-            .padding_y(px(4.0))
-    )])
-    .with_style(style().opacity(0.4))
+    button::Button(#{ text: label, variant: "ghost", disabled: !enabled, on_click: handler })
 }
 
 /// The breadcrumb bar: history buttons, the root path, then the crumb path.
@@ -1781,23 +2040,29 @@ fn scan_panel(scan) {
     } else {
         `Read ${scan.root}`
     };
-    let spinner = if reading { "◐" } else { "·" };
-    let stats = row([
-        w::stat_cell("files", core::human_count(scan.files), false),
-        w::stat_cell("directories", core::human_count(scan.dirs), false),
-        w::stat_cell("measured", core::human_bytes(scan.bytes), false),
-        w::stat_cell("unreadable", core::human_count(scan.errors), scan.errors > 0),
+    let status_row = row([
+        if reading {
+            spinner::Spinner(#{ key: "scan-spinner", label: "Reading" })
+        } else {
+            box([])
+        },
+        text(status).with_style(
+            style()
+                .typography("subtitle")
+                .text_color(theme_color("text_primary"))
+        ),
     ])
-    .with_style(
-        style()
-            .flex_row()
-            .gap(px(10.0))
-            .width(relative(1.0))
-    );
+    .with_style(style().flex_row().items_center().gap(px(10.0)).padding_bottom(px(14.0)));
+    let figures = stat::stats([
+        #{ label: "files", value: core::human_count(scan.files) },
+        #{ label: "directories", value: core::human_count(scan.dirs) },
+        #{ label: "measured", value: core::human_bytes(scan.bytes) },
+        #{ label: "unreadable", value: core::human_count(scan.errors) },
+    ]);
     let action = if reading {
-        w::Button(#{ label: "Cancel", variant: "outline", on_click: Fn("scan_cancel") })
+        button::Button(#{ text: "Cancel", variant: "outline", on_click: Fn("scan_cancel") })
     } else {
-        w::Button(#{ label: "Scan again", variant: "outline", on_click: Fn("scan_again") })
+        button::Button(#{ text: "Scan again", variant: "primary", on_click: Fn("scan_again") })
     };
     let note = if scan.phase == "cancelled" {
         "Nothing is shown from a scan that did not finish. Scan again to retry."
@@ -1808,21 +2073,22 @@ fn scan_panel(scan) {
     };
 
     column([
-        row([
-            text(`${spinner}  ${status}`).with_style(
-                style()
-                    .font_size(px(15.0))
-                    .font_weight(600)
-                    .text_color(theme_color("text_primary"))
-            ),
-        ])
-        .with_style(style().flex_row().padding_bottom(px(14.0))),
-        stats,
-        box([w::progress_track(progress_estimate(scan.bytes))])
-            .with_style(style().padding_y(px(14.0))),
+        status_row,
+        figures,
+        box([progress::Progress(#{
+            key: "scan-progress",
+            label: "Scan progress",
+            value: progress_estimate(scan.bytes) * 100.0,
+            max: 100.0,
+            width: 504,
+        })])
+        .with_style(style().padding_y(px(14.0))),
         row([
             text(note).with_style(
-                style().font_size(px(11.0)).text_color(theme_color("text_muted")).flex_grow()
+                style()
+                    .typography("caption")
+                    .text_color(theme_color("text_muted"))
+                    .flex_grow()
             ),
             action,
         ])
@@ -1891,7 +2157,7 @@ fn find_bar(open, find, layout) {
 
 /// The main stage: the scan panel while scanning, the mosaic when a layout
 /// is cached. The help overlay floats above both.
-fn stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light) {
+fn stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light, paint) {
     let content = ();
     if !layout.valid {
         content = box([scan_panel(scan)])
@@ -1906,7 +2172,7 @@ fn stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light) {
             );
     } else {
         content = box(
-            mosaic_nodes(layout, cursor, metric, scan, mode)
+            mosaic_nodes(layout, cursor, metric, scan, paint)
         )
             .with_key("mosaic")
             .with_ref(viewport_ref)
@@ -1932,10 +2198,9 @@ fn stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light) {
 /// hatch — identical nodes across hover crossings, so the retained renderer
 /// keeps it untouched), a tiny ring canvas rebuilt per crossing, and the
 /// cached labels. Pointer events ride the base canvas.
-fn mosaic_nodes(layout, cursor, metric, scan, mode) {
-    let paint = layout.paint_by_mode[`${mode}`];
+fn mosaic_nodes(layout, cursor, metric, scan, paint) {
     if paint == () {
-        paint = #{ base: [], labels: [] };
+        paint = #{ base: [], labels: [], out_keys: #{} };
     }
     let base = canvas(canvas_scene(paint_commands(paint.base, layout.view)))
         .with_key("mosaic_canvas")
@@ -1960,7 +2225,7 @@ fn mosaic_nodes(layout, cursor, metric, scan, mode) {
                 .height(px(layout.height))
         );
     [base, rings]
-        + label_nodes(paint.labels, layout, metric)
+        + label_nodes(paint.labels, layout, metric, paint.out_keys)
         + tooltip_nodes(layout, cursor, metric, scan)
 }
 
@@ -2023,17 +2288,18 @@ fn paint_commands(rows, view) {
 /// as plain rows: ["r", key, x, y, w, h, color] / ["l", key, x1, y1, x2,
 /// y2, width, color]. Colors are already resolved ints, so turning a row
 /// back into a command at render is one native call.
-fn tile_base_commands(tile, mode, light, now) {
+fn tile_base_commands(tile, mode, light, now, out_keys) {
     let key = tile_key(tile);
+    let dim = key in out_keys;
     let r = tile.rect;
     let fill = ();
     if tile.kind == "others" {
         // The merged tail has no entry of its own; it wears the neutral tone.
-        fill = core::category_fill_mode("other", tile.depth, light);
+        fill = core::category_fill_mode("other", tile.depth, light, dim);
     } else if mode == 2 {
-        fill = core::age_fill_mode(core::age_days(tile.entry.modified, now), light);
+        fill = core::age_fill_mode(core::age_days(tile.entry.modified, now), light, dim);
     } else {
-        fill = core::category_fill_mode(tile.entry.category, tile.depth, light);
+        fill = core::category_fill_mode(tile.entry.category, tile.depth, light, dim);
     }
     let rows = [
         #{ t: "r", k: `f:${key}`, x: r.x, y: r.y, w: r.w, h: r.h, c: fill },
@@ -2129,7 +2395,7 @@ fn sorted_label_candidates(tiles) {
 }
 /// The label nodes for one render: screen-space threshold over the cached,
 /// area-sorted candidates, at most 150.
-fn label_nodes(indices, layout, metric) {
+fn label_nodes(indices, layout, metric, out_keys) {
     let labels = [];
     let count = 0;
     for index in indices {
@@ -2141,7 +2407,7 @@ fn label_nodes(indices, layout, metric) {
         if r.w < 54.0 || r.h < 15.0 {
             continue;
         }
-        let label = tile_label(tile, metric, layout.view);
+        let label = tile_label(tile, metric, layout.view, tile_key(tile) in out_keys);
         if label != () {
             labels.push(label);
             count += 1;
@@ -2150,7 +2416,7 @@ fn label_nodes(indices, layout, metric) {
     labels
 }
 
-fn tile_label(tile, metric, view) {
+fn tile_label(tile, metric, view, dim) {
     let key = tile_key(tile);
     let r = core::view_project(view, tile.rect);
     if tile.kind == "others" {
@@ -2177,12 +2443,18 @@ fn tile_label(tile, metric, view) {
     if tile.header != () {
         // A subdivided directory: bold name in its band, size at the end.
         let band = core::view_project(view, tile.header);
+        let label_color = theme_color("text_primary");
+        let value_color = theme_color("text_muted");
+        if dim {
+            label_color = theme_color("disabled");
+            value_color = theme_color("disabled");
+        }
         return row([
             text(name).with_style(
                 style()
                     .font_size(px(12.0))
                     .font_weight(700)
-                    .text_color(theme_color("text_primary"))
+                    .text_color(label_color)
                     .overflow_hidden()
                     .whitespace_nowrap().text_ellipsis()
                     .flex_grow()
@@ -2190,7 +2462,7 @@ fn tile_label(tile, metric, view) {
             text(value).with_style(
                 style()
                     .font_size(px(11.0))
-                    .text_color(theme_color("text_muted"))
+                    .text_color(value_color)
                     .whitespace_nowrap().text_ellipsis()
             ),
         ])
@@ -2211,11 +2483,17 @@ fn tile_label(tile, metric, view) {
     }
     // A closed tile: name, with the size beneath when there is height.
     let stacked = r.h > 30.0;
+    let label_color = theme_color("text_primary");
+    let value_color = theme_color("text_muted");
+    if dim {
+        label_color = theme_color("disabled");
+        value_color = theme_color("disabled");
+    }
     let nodes = [
         text(name).with_style(
             style()
                 .font_size(px(11.0))
-                .text_color(theme_color("text_primary"))
+                .text_color(label_color)
                 .overflow_hidden()
                 .whitespace_nowrap().text_ellipsis()
         ),
@@ -2225,7 +2503,7 @@ fn tile_label(tile, metric, view) {
             text(value).with_style(
                 style()
                     .font_size(px(11.0))
-                    .text_color(theme_color("text_muted"))
+                    .text_color(value_color)
                     .overflow_hidden()
                     .whitespace_nowrap().text_ellipsis()
             )
@@ -2357,452 +2635,55 @@ fn ago_label(modified, now) {
     `${days / 365} y ago`
 }
 
-// -- sidebar --------------------------------------------------------------------
-
-/// Selection / Worth a look / Disk — gpuix's right panel, in theme tokens.
-fn sidebar(scan, layout, cursor, mode) {
-    let selection = selection_panel(scan, layout, cursor);
-    let worth = worth_panel(scan, layout);
-    let disk = disk_panel(scan);
-    column([selection, divider(), worth, divider(), disk])
-        .with_key("sidebar")
-        .with_style(
-            style()
-                .flex_col()
-                .width(px(264.0))
-                .flex_shrink(false)
-                .padding_x(px(14.0))
-                .padding_y(px(10.0))
-                .gap(px(12.0))
-                .border_left(px(1.0))
-                .border_color(theme_color("border"))
-                .overflow_hidden()
-        )
-}
-
-fn divider() {
-    box([]).with_style(
-        style()
-            .width(relative(1.0))
-            .height(px(1.0))
-            .background(theme_color("border"))
-            .flex_shrink(false)
-    )
-}
-
-fn eyebrow(label) {
-    text(label).with_style(
-        style()
-            .font_size(px(10.0))
-            .font_weight(700)
-            .text_color(theme_color("text_muted"))
-    )
-}
-
-fn share_bar(fraction, color) {
-    let w = fraction * 100.0;
-    if w < 1.0 && w > 0.0 {
-        w = 1.0;
-    }
-    box([
-        box([]).with_style(
-            style()
-                .width(relative(w / 100.0))
-                .height(px(3.0))
-                .background(color)
-                .flex_shrink(false)
-        ),
-    ])
-    .with_style(
-        style()
-            .width(relative(1.0))
-            .height(px(3.0))
-            .background(theme_color("surface_raised"))
-            .overflow_hidden()
-    )
-}
-
-/// What is selected — or hovered, or on screen — with its figures.
-fn selection_panel(scan, layout, cursor) {
-    let crumbs = layout.crumbs;
-    if cursor.selected != () && core::crumb_starts_with(cursor.selected, layout.crumbs) {
-        crumbs = cursor.selected;
-    } else if cursor.crumbs != () && core::crumb_starts_with(cursor.crumbs, layout.crumbs) {
-        crumbs = cursor.crumbs;
-    }
-    let name = root_name(layout);
-    let bytes = layout.total;
-    let files = scan.files;
-    let dirs = scan.dirs;
-    let modified = scan.now;
-    let kind = "folder";
-    let entry = node_entry_static(crumbs, layout);
-    if entry != () {
-        name = entry.entry.name;
-        bytes = entry.entry.bytes;
-        files = entry.entry.files;
-        dirs = entry.entry.dirs;
-        modified = entry.entry.modified;
-        if entry.kind != "dir" {
-            kind = "file";
-        }
-    }
-    let share = 0.0;
-    if layout.total > 0 {
-        share = bytes.to_float() / layout.total.to_float();
-    }
-    let path = selection_path(layout, crumbs, name);
-    let size_parts = split_first_word(core::human_bytes(bytes));
-    let size_value = size_parts[0];
-    let size_unit = size_parts[1];
-    let is_dir = kind == "folder";
-    let below_root = crumbs.len() > layout.crumbs.len();
-    let actions = [];
-    if is_dir && below_root {
-        actions.push(pill_button("Open", true, crumbs));
-    }
-    actions.push(pill_button("Reveal", false, crumbs));
-    column([
-        eyebrow("Selection"),
-        row([
-            box([]).with_style(
-                style()
-                    .width(px(3.0))
-                    .height(px(16.0))
-                    .background(theme_color("accent"))
-                    .flex_shrink(false)
-            ),
-            text(name).with_style(
-                style()
-                    .font_size(px(14.0))
-                    .font_weight(600)
-                    .text_color(theme_color("text_primary"))
-                    .overflow_hidden()
-                    .whitespace_nowrap().text_ellipsis()
-                    .flex_grow()
-            ),
-        ])
-        .with_style(style().flex_row().items_center().gap(px(8.0)).width(relative(1.0))),
-        text(path).with_style(
-            style()
-                .font_size(px(10.0))
-                .text_color(theme_color("text_muted"))
-                .overflow_hidden()
-                .whitespace_nowrap().text_ellipsis()
-                .width(relative(1.0))
-        ),
-        row([
-            text(size_value).with_style(
-                style()
-                    .font_size(px(26.0))
-                    .font_weight(300)
-                    .text_color(theme_color("text_primary"))
-            ),
-            text(size_unit).with_style(
-                style()
-                    .font_size(px(12.0))
-                    .text_color(theme_color("text_muted"))
-                    .self_end()
-                    .padding_left(px(4.0))
-            ),
-        ])
-        .with_style(style().flex_row().items_end().padding_y(px(6.0))),
-        share_bar(share, theme_color("accent")),
-        row([
-            figure("Of scan", `${(share * 100.0).to_int()}%`),
-            figure("Files", core::human_count(files)),
-        ])
-        .with_style(style().flex_row().gap(px(16.0)).padding_y(px(8.0))),
-        row([
-            figure("Last write", ago_label(modified, scan.now)),
-            figure("Kind", kind),
-        ])
-        .with_style(style().flex_row().gap(px(16.0))),
-        row(actions)
-        .with_style(style().flex_row().gap(px(8.0)).padding_y(px(4.0))),
-    ])
-    .with_style(style().flex_col().gap(px(6.0)).width(relative(1.0)))
-}
-
-/// ["4.2", "GiB"] from "4.2 GiB".
-fn split_first_word(text_value) {
-    let cut = text_value.index_of(" ");
-    if cut < 0 {
-        return [text_value, ""];
-    }
-    [text_value.sub_string(0, cut), text_value.sub_string(cut + 1)]
-}
-
-/// A small Open/Reveal pill carrying the crumbs it acts on.
-fn pill_button(label, primary, crumbs) {
-    let background = theme_color("surface");
-    let color = theme_color("text_primary");
-    let border_color = theme_color("border");
-    if primary {
-        background = theme_color("accent");
-        color = theme_color("on_accent");
-        border_color = theme_color("accent");
-    }
-    let handler = Fn("reveal_clicked");
-    if primary {
-        handler = Fn("open_clicked");
-    }
-    box([text(label).with_style(
-        style()
-            .font_size(px(11.0))
-            .font_weight(600)
-            .text_color(color)
-            .padding_x(px(10.0))
-            .padding_y(px(4.0))
-    )])
-    .on_click_value(handler, crumbs)
-    .with_style(
-        style()
-            .background(background)
-            .border(px(1.0))
-            .border_color(border_color)
-            .flex_shrink(false)
-    )
-}
-
-/// The selection's path, from the cached crumb names: root + the crumb
-/// trail + the selected entry's own name.
-fn selection_path(layout, crumbs, name) {
-    let built = layout.root;
-    let i = 0;
-    while i < layout.names.len() && i < crumbs.len() {
-        let shown = layout.names[i];
-        if shown == "" {
-            shown = "?";
-        }
-        built = `${built}/${shown}`;
-        i += 1;
-    }
-    if crumbs.len() > layout.names.len() {
-        built = `${built}/${name}`;
-    }
-    built
-}
-
-fn figure(label, value) {
-    column([
-        text(label).with_style(
-            style().font_size(px(10.0)).text_color(theme_color("text_muted"))
-        ),
-        text(value).with_style(
-            style().font_size(px(12.0)).text_color(theme_color("text_primary"))
-        ),
-    ])
-    .with_style(style().flex_col().gap(px(2.0)))
-}
-
-/// The entry a crumb path points at, from the cached layout tiles first
-/// (no capability call), falling back to `()`.
-fn node_entry_static(crumbs, layout) {
-    if crumbs == () || crumbs.len() == 0 {
-        return ();
-    }
-    tile_lookup(layout, crumb_key(crumbs))
-}
-
-fn root_name(layout) {
-    let parts = split_path(layout.root);
-    if parts.len() > 0 {
-        return parts[parts.len() - 1];
-    }
-    layout.root
-}
-
-/// Worth a look: the scanner's findings, clickable to select.
-fn worth_panel(scan, layout) {
-    let rows = [];
-    let rows_node = [];
-    let largest = 1;
-    for finding in layout.insights {
-        if finding.bytes > largest {
-            largest = finding.bytes;
-        }
-    }
-    for finding in layout.insights {
-        let fraction = finding.bytes.to_float() / largest.to_float();
-        rows_node.push(
-            column([
-                row([
-                    box([]).with_style(
-                        style()
-                            .width(px(3.0))
-                            .height(px(26.0))
-                            .background(theme_color("accent"))
-                            .flex_shrink(false)
-                    ),
-                    column([
-                        text(finding.label).with_style(
-                            style()
-                                .font_size(px(11.0))
-                                .text_color(theme_color("text_primary"))
-                                .overflow_hidden()
-                                .whitespace_nowrap().text_ellipsis()
-                                .width(px(130.0))
-                        ),
-                        text(finding.detail).with_style(
-                            style()
-                                .font_size(px(10.0))
-                                .text_color(theme_color("text_muted"))
-                                .overflow_hidden()
-                                .whitespace_nowrap().text_ellipsis()
-                                .width(px(130.0))
-                        ),
-                    ])
-                    .with_style(style().flex_col().gap(px(1.0)).flex_grow()),
-                    column([
-                        text(core::human_bytes_short(finding.bytes)).with_style(
-                            style()
-                                .font_size(px(11.0))
-                                .text_color(theme_color("text_primary"))
-                        ),
-                        share_bar(fraction, theme_color("accent")),
-                    ])
-                    .with_style(style().flex_col().gap(px(4.0)).items_end().flex_shrink(false)),
-                ])
-                .with_style(style().flex_row().items_center().gap(px(8.0)).width(relative(1.0))),
-            ])
-            .on_click_value(Fn("insight_clicked"), index_of_finding(layout, finding))
-            .with_style(
-                style()
-                    .flex_col()
-                    .padding_x(px(6.0))
-                    .padding_y(px(5.0))
-                    .width(relative(1.0))
-                    .hover(style().background(theme_color("surface_raised")))
-            )
-        );
-    }
-    let total = 0;
-    for finding in layout.insights {
-        total += finding.bytes;
-    }
-    let header = row([
-        eyebrow("Worth a look"),
-        text(core::human_bytes_short(total)).with_style(
-            style().font_size(px(10.0)).text_color(theme_color("accent"))
-        ),
-    ])
-    .with_style(style().flex_row().justify_between().width(relative(1.0)));
-    if layout.insights.len() == 0 {
-        return column([
-            header,
-            text("Nothing obviously disposable").with_style(
-                style().font_size(px(11.0)).text_color(theme_color("text_muted"))
-            ),
-        ])
-        .with_style(style().flex_col().gap(px(8.0)).width(relative(1.0)));
-    }
-    column([header] + rows_node)
-        .with_style(style().flex_col().gap(px(4.0)).width(relative(1.0)).flex_grow().overflow_hidden())
-}
-
-fn index_of_finding(layout, finding) {
-    let i = 0;
-    while i < layout.insights.len() {
-        if crumb_key(layout.insights[i].crumbs) == crumb_key(finding.crumbs) {
-            return i;
-        }
-        i += 1;
-    }
-    0
-}
-
-/// Disk: how much of the scanned volume is still free.
-fn disk_panel(scan) {
-    let nodes = [eyebrow("Disk")];
-    if scan.space != () {
-        let total = scan.space.total;
-        let free = scan.space.available;
-        let used_fraction = 0.0;
-        if total > 0 {
-            used_fraction = (total - free).to_float() / total.to_float();
-        }
-        let free_parts = split_first_word(core::human_bytes(free));
-        nodes.push(
-            row([
-                text(free_parts[0]).with_style(
-                    style()
-                        .font_size(px(20.0))
-                        .font_weight(300)
-                        .text_color(theme_color("text_primary"))
-                ),
-                text(`${free_parts[1]} free`).with_style(
-                    style()
-                        .font_size(px(11.0))
-                        .text_color(theme_color("text_muted"))
-                        .self_end()
-                        .padding_bottom(px(3.0))
-                        .padding_left(px(4.0))
-                ),
-            ])
-            .with_style(style().flex_row().items_end().padding_y(px(4.0)))
-        );
-        nodes.push(share_bar(used_fraction, theme_color("accent")));
-        nodes.push(
-            text(`${core::human_bytes_short(total - free)} used of ${core::human_bytes_short(total)}`).with_style(
-                style().font_size(px(10.0)).text_color(theme_color("text_muted"))
-            )
-        );
-    }
-    column(nodes).with_style(style().flex_col().gap(px(6.0)).width(relative(1.0)).flex_shrink(false))
-}
-
 // -- help overlay ----------------------------------------------------------------
 
+/// One help row: the chord as real Kbd keycaps, the description beside it.
+fn help_row(keys, description) {
+    row([
+        kbd::Kbd(#{ keys: keys, label: description })
+            .with_style(style().flex_shrink(false).width(px(150.0))),
+        text(description).with_style(
+            style()
+                .typography("body_small")
+                .text_color(theme_color("text_muted"))
+                .flex_grow()
+        ),
+    ])
+    .with_style(style().flex_row().items_center().gap(px(10.0)).width(relative(1.0)))
+}
+
 fn help_overlay() {
-    let keys = [
-        ["enter", "open the selected directory"],
-        ["u / ⌫", "up one level"],
-        ["h j k l / arrows", "move between tiles"],
-        ["tab", "next sibling by size"],
-        ["t", "size · files · age"],
-        ["[ ]", "fewer or more levels"],
-        ["- = 0", "zoom out, in, reset"],
-        ["wheel", "zoom toward the pointer"],
-        ["shift + wheel", "pan"],
-        ["i / d", "hidden files · apparent size"],
-        ["r", "rescan"],
-        ["alt ← →", "history back / forward"],
-        ["p", "show or hide this panel"],
-        ["o", "reveal in the file manager"],
-        ["esc", "close · drop selection · up"],
-        ["q", "quit"],
+    let rows = [
+        help_row(["enter"], "open the selected directory"),
+        help_row(["u", "⌫"], "up one level"),
+        help_row(["h", "j", "k", "l"], "move between tiles"),
+        help_row(["tab"], "next sibling by size"),
+        help_row(["t"], "size · files · age"),
+        help_row(["[", "]"], "fewer or more levels"),
+        help_row(["-", "=", "0"], "zoom out, in, reset"),
+        help_row(["wheel"], "zoom toward the pointer"),
+        help_row(["shift", "wheel"], "pan"),
+        help_row(["i", "d"], "hidden files · apparent size"),
+        help_row(["r"], "rescan"),
+        help_row(["e"], "cycle the theme"),
+        help_row(["alt", "←", "→"], "history back / forward"),
+        help_row(["p"], "show or hide this panel"),
+        help_row(["o"], "reveal in the file manager"),
+        help_row(["esc"], "close · drop selection · up"),
+        help_row(["q"], "quit"),
     ];
-    let rows = [];
-    for pair in keys {
-        rows.push(
-            row([
-                w::keycap(pair[0]).with_style(style().flex_shrink(false).width(px(120.0))),
-                text(pair[1]).with_style(
-                    style()
-                        .font_size(px(12.0))
-                        .text_color(theme_color("text_muted"))
-                        .flex_grow()
-                ),
-            ])
-            .with_style(style().flex_row().items_center().gap(px(10.0)).width(relative(1.0)))
-        );
-    }
     box([
         column([
             row([
                 text("keys").with_style(
                     style()
-                        .font_size(px(14.0))
-                        .font_weight(700)
+                        .typography("title")
                         .text_color(theme_color("text_primary"))
                         .flex_grow()
                 ),
-                text("? esc").with_style(
-                    style().font_size(px(11.0)).text_color(theme_color("text_muted"))
-                ),
+                kbd::Kbd(#{ keys: ["?", "esc"], label: "Close help" }),
             ])
-            .with_style(style().flex_row().width(relative(1.0))),
+            .with_style(style().flex_row().items_center().width(relative(1.0))),
         ] + rows)
         .with_style(
             style()
@@ -2844,22 +2725,38 @@ fn footer(scan, layout) {
         ""
     };
     row([
-        text("enter · u · / · t · [ ] · ?").with_style(
-            style().font_size(px(10.0)).text_color(theme_color("text_muted"))
-        ),
-        text(status).with_style(
-            style().font_size(px(10.0)).text_color(theme_color("text_muted"))
-        ),
+        row([
+            footer_hint(["enter"], "open"),
+            footer_hint(["u"], "up"),
+            footer_hint(["/"], "filter"),
+            footer_hint(["t"], "mode"),
+            footer_hint(["[", "]"], "depth"),
+            footer_hint(["?"], "keys"),
+        ])
+        .with_style(style().flex_row().items_center().gap(px(10.0))),
+        text(status),
     ])
     .with_style(
         style()
             .flex_row()
+            .items_center()
             .justify_between()
             .padding_x(px(16.0))
             .padding_y(px(6.0))
             .border_top(px(1.0))
             .border_color(theme_color("border"))
+            .typography("caption")
+            .text_color(theme_color("text_muted"))
     )
+}
+
+/// One chord + verb pair of the key legend.
+fn footer_hint(keys, label) {
+    row([
+        kbd::Kbd(#{ keys: keys, label: label, appearance: "inline" }),
+        text(label),
+    ])
+    .with_style(style().flex_row().items_center().gap(px(4.0)).flex_shrink(false))
 }
 
 // ---------------------------------------------------------------------------
@@ -2880,7 +2777,7 @@ fn init(ctx) {
     } else if args.theme_mode == "system" {
         ctx.set_theme_system("Disktree");
     } else {
-        ctx.set_theme("Disktree", "Tokyo Night");
+        ctx.set_theme("Disktree", "Minimal Gray");
     }
     ctx.set_app_store("disktree", "args", #{ path: args.path, home: home });
     ctx.set_app_store("disktree", "scan", #{
@@ -2897,7 +2794,7 @@ fn init(ctx) {
         elapsed_ms: 0,
         now: 0,
     });
-    ctx.set_app_store("disktree", "layout", empty_layout());
+    reset_derived_layout(ctx);
     ctx.set_app_store(
         "disktree",
         "cursor",

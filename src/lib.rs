@@ -2,7 +2,8 @@
 //! faithful port of tobi/disktree's `disktree-core` for Linux.
 //!
 //! The binary (`src/main.rs`) is the thin host: window plumbing, skins, and
-//! the capability bridge. This library has no gpui-rhai dependency.
+//! the capability bridge.
 
 pub mod capability;
+pub mod embedded;
 pub mod engine;

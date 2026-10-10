@@ -1,6 +1,7 @@
-// disktree-rhai light theme — Flexoki Light (Steph Ango's Flexoki, light
+// disktree-rhai light palette — Flexoki Light (Steph Ango's Flexoki, light
 // mode). The dark default lives in ../theme.rhai; both are variants of the
-// one "Disktree" family, so the app can switch without re-mounting.
+// one "Disktree" family, so the app can switch without re-mounting. Colors
+// only: layout tokens come from the token base (../tokens.rhai).
 fn theme() {
     #{
         family: "Disktree",
@@ -27,38 +28,6 @@ fn theme() {
                 selection: 0xe6e4d9ff,
                 disabled: 0x87837dff,
                 scrim: 0x100f0f33,
-            },
-            spacing: #{
-                xxs: #{ unit: "pixels", value: 2.0 },
-                xs: #{ unit: "pixels", value: 4.0 },
-                sm: #{ unit: "pixels", value: 8.0 },
-                md: #{ unit: "pixels", value: 12.0 },
-                lg: #{ unit: "pixels", value: 16.0 },
-            },
-            radii: #{
-                sm: #{ unit: "pixels", value: 0.0 },
-                md: #{ unit: "pixels", value: 0.0 },
-                lg: #{ unit: "pixels", value: 0.0 },
-            },
-            typography: #{
-                roles: #{
-                    caption: #{ size: #{ unit: "pixels", value: 11.0 },
-                        line_height: #{ unit: "pixels", value: 16.0 }, weight: 400 },
-                    body_small: #{ size: #{ unit: "pixels", value: 12.0 },
-                        line_height: #{ unit: "pixels", value: 16.0 }, weight: 400 },
-                    body: #{ size: #{ unit: "pixels", value: 13.0 },
-                        line_height: #{ unit: "pixels", value: 18.0 }, weight: 400 },
-                    subtitle: #{ size: #{ unit: "pixels", value: 14.0 },
-                        line_height: #{ unit: "pixels", value: 20.0 }, weight: 400 },
-                    title: #{ size: #{ unit: "pixels", value: 16.0 },
-                        line_height: #{ unit: "pixels", value: 22.0 }, weight: 700 },
-                    heading: #{ size: #{ unit: "pixels", value: 18.0 },
-                        line_height: #{ unit: "pixels", value: 24.0 }, weight: 700 },
-                    display: #{ size: #{ unit: "pixels", value: 24.0 },
-                        line_height: #{ unit: "pixels", value: 32.0 }, weight: 700 },
-                    display_large: #{ size: #{ unit: "pixels", value: 28.0 },
-                        line_height: #{ unit: "pixels", value: 36.0 }, weight: 700 },
-                },
             },
         },
     }

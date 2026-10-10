@@ -63,9 +63,10 @@ screenshot/state evidence confirmed the tobi-expected behaviour.
 
 ## Skins & themes
 
-- ✅ `--export-skin NAME` writes app.toml, main.rhai, core.rhai,
-  components/widgets.rhai, theme.rhai, themes/flexoki_light.rhai to
-  `$XDG_CONFIG_HOME/disktree-rhai/skins/NAME/`
+- ✅ `--export-skin NAME` writes app.toml, main.rhai, core.rhai, tokens.rhai,
+  components/, layouts/, patterns/, assets/, theme.rhai,
+  themes/flexoki_light.rhai to `$XDG_CONFIG_HOME/disktree-rhai/skins/NAME/`
+  (byte-identical to `ui/`, verified by diff)
 - ✅ editing the export and running `--skin NAME` loads the edited copy
   (verified: header text change visible)
 - ✅ `--dev`/`--skin-dev` hot-reload edits within ≤3 s; a broken edit
@@ -78,7 +79,35 @@ screenshot/state evidence confirmed the tobi-expected behaviour.
 
 ## Known deviations (v1)
 
-- crumb sibling menu (tobi's click-a-crumb dropdown) — v1.2 candidate
-- labels dim-while-typing in find — cosmetic, not ported
 - shift+tab reverse cycle — node key handlers carry no modifiers (G7/G8)
-- growth animation on enter/ascend — v1.5 by design
+- double-click on the panel edge resets its width — SplitPane exposes no
+  double-click on the handle (gpui-rhai gap, see UPSTREAM_GAPS)
+- find input cannot type uppercase or non-Latin characters — node key
+  events carry no key_char (G7/G8)
+- widening scan (`g`, dim crumbs above the root) — v1.5 by design
+
+2026-10-07 later: the platform title bar is replaced by the official
+TitleBar component (window drag + double-press zoom, traffic-light inset;
+`window_drag_areas(true)` on the mount config — off by default upstream),
+theme switching rebuilds the mosaic paint so tiles follow the new palette,
+and `docs/screenshots/` is refreshed from the new offscreen screenshot
+example. The theme list's families match the bundled palettes exactly
+("Tokyo Night", "Retro 82" — with spaces).
+
+Shipped 2026-10-07 (was open): the crumb ▾ sibling menu, dim-while-typing
+(tile fills, not just labels), the colour legend + scan totals row,
+right-click reveal, sidebar drag-resize with responsive hide, git state in
+the selection panel, the navigation growth animation, 17-palette theme
+switching, and the end-to-end key harness (`cargo run --example
+key_harness`).
+
+
+## 2026-10-10 — gpui-rhai 0.2 validation complete
+
+All core contracts exercised and passing. One open upstream issue
+(G12/#140: SplitPane drops absolute content) with a hand-rolled drag
+workaround; filed at github.com/eddix/gpui-rhai/issues/140. Remaining
+minor gaps: G7/G8 (no key_char for uppercase/IME), G11 partial (no
+double-click on split handle). Acceptance trio: skin_check (3-source
+prepare), key_harness (real-window all-keys + mouse drag), screenshot
+(offscreen PIL-verified).

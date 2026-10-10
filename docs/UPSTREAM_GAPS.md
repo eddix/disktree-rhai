@@ -154,6 +154,17 @@ around locally, or accepted).
   store field holding tiles + a tile cache + paint rows crosses 10k array
   elements easily; hatch slashes alone (hundreds of 4-element coordinate
   rows) were the hidden multiplier.
+- **Hit again at (0.2 migration, 2026-10)**: the first real-disk scan after
+  the gpui-rhai 0.2 upgrade failed at render with the same error — the
+  layout store value alone now carries tiles (2,000) + one crumbs array per
+  tile + the cache slot (tiles again) + up to three built mode paints. Two
+  more skin-side measures shipped: the paint slots (`paint0`-`paint2`) and
+  the tile cache (`cache`) moved out of `layout` into their own app-store
+  values (each store value gets its own cumulative budget; the host declares
+  them in `DisktreeExtension::configure_runtime`), and the tile budget now
+  scales with the crumb depth — `8500 / (root_len + max_depth + 2)`, clamped
+  to 250..2000 — so tiles × crumb length stays under the limit at any
+  navigation depth.
 - **Workaround (skin-side, shipped)**: paint rows are maps (separate
   budget); hatch slash coordinates are not stored at all — the row keeps
   the tile rect and the render regenerates slashes in ~30 loop steps; the
@@ -164,6 +175,51 @@ around locally, or accepted).
 - **Suggested upstream**: (a) document the cumulative semantics in the
   store/capability docs; (b) like PR #96 did for the op budget, let hosts
   configure (or raise) `max_array_size` for trusted embedded skins.
+
+## G11 — Timer-driven script animation and handle double-clicks
+
+- **Hit at**: the 2026-07 fidelity pass. (a) The navigation growth animation
+  steps itself with `timeout(key, 16ms, cb, payload)` — a declared timer is
+  one-shot and remembered by signature, so the chain only re-arms because
+  the step number rides in the payload; `ctx.motion_duration` supplies the
+  step count so reduced motion collapses to zero steps. Workable, but a
+  frame-callback or native interpolation of canvas content would not re-run
+  the Rhai render ~12 times per navigation. (b) tobi's side panel resets its
+  width on a double-click of the drag handle; `components/split_pane`
+  exposes no double-click (or click) event on the handle part, so the reset
+  is not ported.
+- **Suggested upstream**: (a) an animation-frame or native-transition hook
+  scripts can attach to; (b) a handle event or `on_double_click` part hook
+  on SplitPane.
+
+## G12 — SplitPane panels drop absolutely-positioned content (post-grips runtime)
+
+- **Hit at**: the 2026-10-08 component sync (upstream moved past the resize
+  rework, `feat(resize): decorative grips` + renderer interaction fixes).
+  The mosaic — canvas plus labels, all absolutely positioned inside the
+  pane — silently vanished; panels and flow-positioned children kept
+  rendering, and no script error fired. Isolated by bisection with PIL
+  pixel checks on offscreen captures: a plain flow box in either SplitPane
+  pane renders; an absolutely-positioned box in EITHER pane (start or end)
+  does not. Pinning the registry's own pre-grips `split_pane.rhai`
+  (351d6ec) against the current runtime reproduces it, so the regression
+  is in the runtime's interaction-wrapper/renderer path, not the component
+  script.
+- **Workaround (skin-side, shipped)**: the side panel split is hand-rolled
+  — a fixed-width panel whose 8px left edge drags via window-coordinate
+  pointer events (press/drag/release, double-press resets, Escape
+  cancels), verified in `key_harness` with real mouse simulation and
+  pixel-diffed in the screenshot tool (`SHOT_DRAG=1`). The official
+  `split_pane.rhai` copy stays in `ui/components/` unused, to re-adopt
+  once upstream fixes this.
+- **Suggested upstream**: render absolutely-positioned descendants of
+  SplitPane (and any native resize primitive wrapper) correctly, or gate
+  the grips rework behind it; a story with an absolute child in each pane
+  would have caught it.
+- **Re-tested 2026-10-09**: still broken after 26 further upstream commits
+  (including `fix(split-pane)` and the Gallery's own SplitPane layout);
+  the official component with the mosaic in either pane reproduces the
+  blank. The hand-rolled drag stays.
 
 ## Verified non-gaps (accused, then cleared)
 

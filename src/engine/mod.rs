@@ -6,6 +6,7 @@
 
 pub mod classify;
 pub mod filter;
+pub mod git;
 pub mod insights;
 pub mod node;
 pub mod scan;

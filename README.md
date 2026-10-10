@@ -37,9 +37,12 @@ disktree-rhai --skin ./skins/minimal   # the bundled second skin
 - `--dev` runs the built-in `ui/` from source with hot reload — the
   dogfood loop the default skin itself is developed in.
 
-A skin directory is `app.toml`, `main.rhai`, `core.rhai`,
-`components/widgets.rhai`, `theme.rhai`, and optional extra theme
-variants under `themes/`. Skins own the tiling (`core.rhai`), the
+A skin directory is `app.toml`, `main.rhai`, `core.rhai`, `tokens.rhai`
+(the gpui-rhai 0.2 token base), `theme.rhai` plus optional extra theme
+variants under `themes/` (palettes own colors only — typography, spacing
+and metrics come from the token base), and the official 0.2 components the
+skin mounts under `components/`, `layouts/`, and `patterns/` (with their
+declared SVGs under `assets/`). Skins own the tiling (`core.rhai`), the
 palette, the panels, and the keymap — everything above the scan
 capabilities.
 

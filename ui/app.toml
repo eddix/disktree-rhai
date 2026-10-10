@@ -1,8 +1,9 @@
 entry = "main"
-runtime_api = 2
+runtime_api = 3
 
 [capabilities]
 "disktree.scan" = "*"
 "disktree.tree" = "*"
 "disktree.open" = "*"
+"disktree.git" = "*"
 "disktree.args" = "*"

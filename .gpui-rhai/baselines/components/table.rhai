@@ -1,0 +1,885 @@
+/* gpui-rhai
+{
+  "id": "components/table",
+  "export": "Table",
+  "version": "0.2.0",
+  "runtime_api": { "min_inclusive": 3, "max_exclusive": 4 },
+  "dependencies": ["components/badge"],
+  "capabilities": {},
+  "assets": ["icons/disclosure_down.svg", "icons/chevron_right.svg", "icons/sort_ascending.svg", "icons/sort_descending.svg"],
+  "tokens": ["surface_raised", "surface_hover", "border", "table.selection", "accent", "selection", "text_primary", "text_muted", "metrics.row", "metrics.inset", "metrics.icon", "spacing.xs", "spacing.sm", "spacing.md", "typography.body", "typography.label", "focus_ring"],
+  "environment": ["density"]
+}
+*/
+// Data-backed Table composed entirely from public Box/Text/virtual_collection APIs.
+// Use either a positive logical-pixel height or fill_height for flex layouts.
+//
+// State: application values are controlled; keyed native width overrides retain drag previews.
+// Example: Table(#{ key: "users", label: "Users", row_key: "id", rows: rows,
+//     columns: columns, height: 420 })
+
+define_component(#{
+    metadata: #{ id: "components/table", "export": "Table", version: "0.2.0",
+        runtime_api: #{ min_inclusive: 3, max_exclusive: 4 },
+        dependencies: ["components/badge"], capabilities: #{},
+        tokens: ["surface_raised", "surface_hover", "border", "table.selection", "accent", "selection", "text_primary", "text_muted", "metrics.row", "metrics.inset", "metrics.icon", "spacing.xs", "spacing.sm", "spacing.md", "typography.body", "typography.label", "focus_ring"],
+        environment: ["density"],
+        assets: ["icons/disclosure_down.svg", "icons/chevron_right.svg", "icons/sort_ascending.svg", "icons/sort_descending.svg"] },
+    schema: #{
+        props: #{
+            key: #{ schema: #{ type: "string" }, required: true, sensitive: false },
+            label: #{ schema: #{ type: "string" }, required: true, sensitive: false,
+                doc: "Accessible name of the table; rows are announced as `<label> row <n>`." },
+            row_key: #{ schema: #{ type: "string" }, required: true, sensitive: false,
+                doc: "Row field whose value, as a string, identifies the row in `selected_keys` and events." },
+            rows: #{ schema: #{ type: "one_of", variants: [
+                #{ type: "array", max_items: 100000,
+                    items: #{ type: "map", values: #{ type: "ui_value" } } },
+                #{ type: "collection" },
+            ] }, required: true, sensitive: false,
+                doc: "Row maps keyed by field, or a NativeCollection that sorts, groups and filters in Rust; cells show values as strings." },
+            query: #{ schema: #{ type: "string" }, required: false, sensitive: false,
+                "default": #{ type: "string", value: "" },
+                doc: "Case-insensitive substring filter over `search_fields`; a non-empty query needs `search_fields`." },
+            search_fields: #{ schema: #{ type: "array", max_items: 256,
+                items: #{ type: "string" } }, required: false, sensitive: false,
+                "default": #{ type: "array", value: [] },
+                doc: "Row fields `query` searches; each is `row_key` or a declared column key." },
+            page: #{ schema: #{ type: "integer", min: 1 }, required: false, sensitive: false,
+                "default": #{ type: "integer", value: 1 },
+                doc: "One-based page shown when `page_size` is set, counted after `query` filters the rows." },
+            page_size: #{ schema: #{ type: "optional", value: #{ type: "integer", min: 1 } },
+                required: false, sensitive: false,
+                doc: "Rows per page; `()` shows every row that matches `query`." },
+            columns: #{ schema: #{ type: "array", max_items: 256, items: #{
+                type: "object", allow_unknown: false, fields: #{
+                    key: #{ schema: #{ type: "string" }, required: true, sensitive: false,
+                        doc: "Row field the column shows; unique among the columns." },
+                    title: #{ schema: #{ type: "string" }, required: true, sensitive: false,
+                        doc: "Header text, shown in capitals in the label voice." },
+                    width: #{ schema: #{ type: "object", allow_unknown: false, fields: #{
+                        kind: #{ schema: #{ type: "string", allowed: ["fixed", "percent", "flex"] }, required: true, sensitive: false,
+                            doc: "`fixed` in logical pixels, `percent` of the viewport width, or `flex` for a share of the space left." },
+                        value: #{ schema: #{ type: "number", exclusive_min: 0.0 }, required: true, sensitive: false,
+                            doc: "Logical pixels up to 16384, a percentage up to 100, or a flex weight, as `kind` says." },
+                    } }, required: true, sensitive: false,
+                        doc: "Width before any resize; store the `column_resize` payload's width here when `on_column_resize` is set." },
+                    align: #{ schema: #{ type: "optional", value: #{ type: "string", allowed: ["start", "center", "end"] } }, required: false, sensitive: false,
+                        doc: "Cell alignment; `()` aligns to `start`, or to `end` in a `numeric` column." },
+                    numeric: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                        "default": #{ type: "bool", value: false },
+                        doc: "Sets the cells in tabular figures and aligns them to the end unless `align` is given." },
+                    typography: #{ schema: #{ type: "optional", value: #{ type: "string" } },
+                        required: false, sensitive: false,
+                        doc: "Typography role of the column's cells, such as `code` for identifiers that must tell 0 from O." },
+                    sortable: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                        "default": #{ type: "bool", value: false },
+                        doc: "Makes the header clickable; clicks cycle ascending, descending and unsorted through `sort_change`." },
+                    resizable: #{ schema: #{ type: "optional", value: #{ type: "bool" } },
+                        required: false, sensitive: false,
+                        doc: "Turns resizing on or off for this column; `()` follows `resizable_columns`." },
+                    min_width: #{ schema: #{ type: "optional", value: #{ type: "number", exclusive_min: 0.0, max: 16384.0 } },
+                        required: false, sensitive: false,
+                        doc: "Smallest width in logical pixels a resize may reach; `()` means 48." },
+                    max_width: #{ schema: #{ type: "optional", value: #{ type: "number", exclusive_min: 0.0, max: 16384.0 } },
+                        required: false, sensitive: false,
+                        doc: "Largest width in logical pixels a resize may reach, at least `min_width`; `()` leaves it open." },
+                    adornments: #{ schema: #{ type: "array", max_items: 4, items: #{
+                        type: "object", allow_unknown: false, fields: #{
+                            text_key: #{ schema: #{ type: "string" }, required: true, sensitive: false,
+                                doc: "Row field whose value is the badge text; an empty or missing value drops the badge." },
+                            variant: #{ schema: #{ type: "string", allowed: ["neutral", "accent", "success", "warning", "danger"] },
+                                required: false, sensitive: false,
+                                "default": #{ type: "string", value: "neutral" },
+                                doc: "Tone of the badge when `variant_key` does not give one." },
+                            variant_key: #{ schema: #{ type: "optional", value: #{ type: "string" } },
+                                required: false, sensitive: false,
+                                doc: "Row field holding the tone per row; it overrides `variant` and must name a valid tone." },
+                            dot: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                                "default": #{ type: "bool", value: false },
+                                doc: "Shows the badge's status lamp before its text." },
+                        },
+                    } }, required: false, sensitive: false,
+                        "default": #{ type: "array", value: [] },
+                        doc: "Status badges drawn in the cell from row fields; a cell whose text repeats a badge shows only the badge." },
+                },
+            } }, required: true, sensitive: false, doc: "Columns in display order; 1 to 256 with unique keys." },
+            height: #{ schema: #{ type: "optional", value: #{ type: "number", exclusive_min: 0.0 } }, required: false, sensitive: false,
+                doc: "Height of the rows area below the header in logical pixels; give exactly one of `height` or `fill_height`." },
+            fill_height: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                "default": #{ type: "bool", value: false },
+                doc: "Grows into the free height of a flex parent instead of a fixed `height`; give exactly one of the two." },
+            estimated_row_height: #{ schema: #{ type: "number", exclusive_min: 0.0 }, required: false, sensitive: false,
+                "default": #{ type: "float", value: 32.0 },
+                doc: "Row height in logical pixels the virtual body assumes before rows are measured; rows draw at `metrics.row`." },
+            loading: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                "default": #{ type: "bool", value: false },
+                doc: "Shows `loading_content` below the header instead of the rows." },
+            loading_content: #{ schema: #{ type: "optional", value: #{ type: "node" } }, required: false, sensitive: false,
+                doc: "Node shown while `loading`; `()` shows a muted \"Loading…\" line." },
+            empty: #{ schema: #{ type: "optional", value: #{ type: "node" } }, required: false, sensitive: false,
+                doc: "Node shown instead of `empty_text` when no row is left to show." },
+            empty_text: #{ schema: #{ type: "string" }, required: false, sensitive: false,
+                "default": #{ type: "string", value: "No results" },
+                doc: "Muted text shown when no row is left after filtering and paging, unless `empty` is given." },
+            striped: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                "default": #{ type: "bool", value: false },
+                doc: "Tints every second displayed row with `surface_raised`." },
+            selection_mode: #{ schema: #{ type: "string", allowed: ["none", "single", "multiple"] }, required: false, sensitive: false,
+                "default": #{ type: "string", value: "none" },
+                doc: "`single` selects the clicked row and a second click clears it, `multiple` toggles it; any mode but `none`, or `on_context_request`, makes the table one tab stop." },
+            selected_keys: #{ schema: #{ type: "array", max_items: 100000, items: #{ type: "string" } }, required: false, sensitive: false,
+                "default": #{ type: "array", value: [] },
+                doc: "Selected row keys; the caller stores the `selection_change` payload and passes it back." },
+            sort: #{ schema: #{ type: "optional", value: #{ type: "object", allow_unknown: false, fields: #{
+                key: #{ schema: #{ type: "string" }, required: true, sensitive: false,
+                    doc: "Key of the sorted column." },
+                direction: #{ schema: #{ type: "string", allowed: ["ascending", "descending"] }, required: true, sensitive: false,
+                    doc: "Sort direction, shown by the header icon." },
+            } } }, required: false, sensitive: false,
+                doc: "Current sort; the caller stores the `sort_change` payload. A NativeCollection is sorted by it; array rows keep the order given." },
+            group_by: #{ schema: #{ type: "optional", value: #{ type: "string" } }, required: false, sensitive: false,
+                doc: "Column key whose values, non-empty strings, group the rows under headers in first-seen order." },
+            collapsed_groups: #{ schema: #{ type: "array", max_items: 100000, items: #{ type: "string" } }, required: false, sensitive: false,
+                "default": #{ type: "array", value: [] },
+                doc: "Group values whose rows are hidden; needs `group_by`, and the caller toggles the `group_toggle` payload in it." },
+            sticky_group_headers: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                "default": #{ type: "bool", value: true },
+                doc: "Keeps the current group header pinned at the top of the rows while they scroll." },
+            resizable_columns: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                "default": #{ type: "bool", value: false },
+                doc: "Makes columns resizable: drag a header edge, double-click it to fit the content, or press Left/Right on its handle." },
+            on_sort_change: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false,
+                doc: "Called with the next `sort`, or `()` after descending, when a sortable header is clicked." },
+            on_selection_change: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false,
+                doc: "Called with the next selected keys when a row is clicked, Up, Down, Home or End is pressed, or a context request selects a row." },
+            on_row_click: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false,
+                doc: "Called with the row key when a row is clicked, or Enter is pressed on the selected row." },
+            on_group_toggle: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false,
+                doc: "Called with the group value when a group header is clicked; without it group headers are not clickable." },
+            on_column_resize: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false,
+                doc: "Called with `#{ key, width }` when a resize ends; with it the caller owns widths and writes `width` into the column." },
+            on_context_request: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false,
+                doc: "Called with `#{ key, column, anchor, source }` on a context request; open a Menu at `anchor`, in window coordinates. Without a selection mode it makes the table a tab stop for Shift+F10 and the menu key." },
+        },
+        state: #{ fields: #{} },
+        events: #{
+            sort_change: #{ payload: #{ type: "optional", value: #{ type: "object", allow_unknown: false, fields: #{
+                key: #{ schema: #{ type: "string" }, required: true, sensitive: false,
+                    doc: "Key of the clicked column." },
+                direction: #{ schema: #{ type: "string", allowed: ["ascending", "descending"] }, required: true, sensitive: false,
+                    doc: "`ascending` for a newly sorted column, `descending` on the second click." },
+            } } }, doc: "Emitted when a sortable header is clicked; the payload is the next `sort`, or `()` after descending." },
+            selection_change: #{ payload: #{ type: "array", max_items: 100000, items: #{ type: "string" } },
+                doc: "Emitted when a click, Up, Down, Home, End or a context request selects rows; the payload is the next selection." },
+            row_click: #{ payload: #{ type: "string" },
+                doc: "Emitted when a row is clicked or Enter is pressed on the selected row; the payload is the row key." },
+            context_request: #{ payload: #{ type: "object", allow_unknown: false, fields: #{
+                key: #{ schema: #{ type: "optional", value: #{ type: "string" } }, required: true, sensitive: false,
+                    doc: "Row the menu is for; `()` from the keyboard when no row is selected or without a selection mode, a menu for the whole table." },
+                column: #{ schema: #{ type: "optional", value: #{ type: "string" } }, required: true, sensitive: false,
+                    doc: "Column key of the right-pressed cell; `()` from the keyboard." },
+                anchor: #{ schema: #{ type: "object", allow_unknown: false, fields: #{
+                    x: #{ schema: #{ type: "number" }, required: true, sensitive: false,
+                        doc: "Left edge in window coordinates, in logical pixels." },
+                    y: #{ schema: #{ type: "number" }, required: true, sensitive: false,
+                        doc: "Top edge in window coordinates, in logical pixels." },
+                    width: #{ schema: #{ type: "number" }, required: true, sensitive: false,
+                        doc: "Width in logical pixels; 0 for a pointer request." },
+                    height: #{ schema: #{ type: "number" }, required: true, sensitive: false,
+                        doc: "Height in logical pixels; 0 for a pointer request." },
+                } }, required: true, sensitive: false,
+                    doc: "Where to open a Menu: the pointer, or the current row's bounds (the table's when there is no current row or it is not laid out)." },
+                source: #{ schema: #{ type: "string", allowed: ["pointer", "keyboard"] }, required: true, sensitive: false,
+                    doc: "`pointer` for a right press, `keyboard` for Shift+F10 or the menu key." },
+            } }, doc: "Emitted on a right press on a cell, after selecting its row unless the selection holds it, or on Shift+F10 or the menu key: for the current row with a selection mode, for the table without one." },
+            group_toggle: #{ payload: #{ type: "string" },
+                doc: "Emitted when a group header is clicked, only with `on_group_toggle` set; the payload is the group value." },
+            column_resize: #{ payload: #{ type: "object", allow_unknown: false, fields: #{
+                key: #{ schema: #{ type: "string" }, required: true, sensitive: false,
+                    doc: "Key of the resized column." },
+                width: #{ schema: #{ type: "object", allow_unknown: false, fields: #{
+                    kind: #{ schema: #{ type: "string", allowed: ["fixed"] }, required: true, sensitive: false,
+                        doc: "Always `fixed`: a resized column has a pixel width." },
+                    value: #{ schema: #{ type: "number", exclusive_min: 0.0 }, required: true, sensitive: false,
+                        doc: "Width in logical pixels, clamped to the column's `min_width` and `max_width`." },
+                } }, required: true, sensitive: false,
+                    doc: "New width, ready to store as the column's `width`." },
+            } }, doc: "Emitted when a header-edge drag ends, a double-click fits the column, or Left/Right on a handle steps it 8px; the payload is the new width." },
+        },
+        slots: #{
+            loading_content: #{ required: false, multiple: false, doc: "Node shown below the header while `loading`." },
+            empty: #{ required: false, multiple: false,
+                doc: "Node shown instead of `empty_text` when no row is left to show." },
+        },
+        parts: ["root", "header", "header_cell", "resize_handle", "body", "group_header", "indicator_bar", "cursor", "focus_frame",
+            "group_indicator", "group_label", "group_count", "row", "row_selected",
+            "loading", "empty"],
+    },
+    render: Fn("render_Table")
+});
+
+import "components/badge" as badge;
+
+fn Table(props) { render_component("components/table", props) }
+fn prop_or(props, name, fallback) { if name in props { props[name] } else { fallback } }
+fn optional_or(props, name, fallback) {
+    if name in props && props[name] != () { props[name] } else { fallback }
+}
+
+fn column_style(column) {
+    // Native Table layout supplies the same viewport-resolved width to header
+    // and virtual cells; cell text starts at the content inset.
+    let cell = style().padding_x(theme_length("metrics.inset")).flex_shrink(false);
+    let align = if "align" in column && column.align != () { column.align } else { "start" };
+    if align == "end" { cell.justify_end() } else if align == "center" { cell.justify_center() } else { cell }
+}
+
+// Numeric columns align to the end and use tabular figures unless an alignment is given.
+fn normalized_columns(columns) {
+    let result = [];
+    for column in columns {
+        let normalized = column;
+        if prop_or(column, "numeric", false) && optional_or(column, "align", ()) == () {
+            normalized.align = "end";
+        }
+        result.push(normalized);
+    }
+    result
+}
+fn numeric_keys(columns) {
+    let keys = #{};
+    for column in columns { if prop_or(column, "numeric", false) { keys[column.key] = true; } }
+    keys
+}
+// Column key -> typography role, for columns that set one (`code` for identifiers).
+fn column_typography(columns) {
+    let roles = #{};
+    for column in columns {
+        let role = optional_or(column, "typography", ());
+        if role != () { roles[column.key] = role; }
+    }
+    roles
+}
+
+fn next_sort(current, key) {
+    if current != () && current.key == key {
+        if current.direction == "ascending" { #{ key: key, direction: "descending" } }
+        else { () }
+    } else { #{ key: key, direction: "ascending" } }
+}
+
+fn sort_action(ctx, payload) { ctx.emit("sort_change", payload); }
+fn row_action(ctx, payload) {
+    ctx.emit("row_click", payload.key);
+    if payload.selection != () { ctx.emit("selection_change", payload.selection); }
+}
+fn group_action(ctx, group) { ctx.emit("group_toggle", group); }
+// Keyboard row navigation moves the selection and keeps the row revealed.
+fn keyboard_select(ctx, key) { ctx.emit("selection_change", [key]); handled() }
+fn keyboard_activate(ctx, key) { ctx.emit("row_click", key); handled() }
+// A right press asks for a context menu for the cell's row; the row is selected first unless
+// the selection already holds it.
+fn cell_context(target, ctx, event) {
+    if event.button != "right" { return propagate(); }
+    if target.select != () { ctx.emit("selection_change", target.select); }
+    ctx.emit("context_request", #{ key: target.key, column: target.column, source: "pointer",
+        anchor: #{ x: event.window.x, y: event.window.y, width: 0.0, height: 0.0 } });
+    event_response().prevent_default().stop()
+}
+// Shift+F10 or the menu key: the current row's bounds are the anchor, the table's when the
+// row is not laid out or there is none.
+fn keyboard_context(ctx, target) {
+    let bounds = if target.index != () { ctx.virtual_item_bounds(target.collection, target.index) }
+        else { () };
+    if bounds == () { bounds = ctx.event_target_bounds(); }
+    let anchor = if bounds == () { #{ x: 0.0, y: 0.0, width: 0.0, height: 0.0 } }
+        else { #{ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height } };
+    ctx.emit("context_request", #{ key: target.key, column: (), anchor: anchor, source: "keyboard" });
+    handled()
+}
+fn column_resize_action(ctx, payload) { ctx.emit("column_resize", payload); }
+
+fn intrinsic_column_measure(key, text_value, signal, extra_width) {
+    gpui_rhai::IntrinsicTextMeasurePrimitive(#{
+        key: key, text: text_value, group: signal,
+        horizontal_padding: theme_length("metrics.inset"), extra_width: extra_width,
+    })
+}
+
+fn clamp_column_width(value, min_width, max_width) {
+    let result = if value < min_width { min_width } else { value };
+    if max_width != () && result > max_width { max_width } else { result }
+}
+
+fn column_resize_key(ctx, payload) {
+    let current = ctx.get_signal(payload.signal_key);
+    if current == () {
+        let bounds = ctx.element_bounds(payload.ref_key);
+        if bounds == () { return; }
+        current = bounds.layout.width;
+    }
+    let width = clamp_column_width(current + payload.delta, payload.min_width, payload.max_width);
+    ctx.set_signal(payload.signal_key, width);
+    ctx.emit("column_resize", #{ key: payload.column_key,
+        width: #{ kind: "fixed", value: width } });
+    if payload.controlled { ctx.set_signal(payload.signal_key, ()); }
+}
+
+fn render_table_row(resize_signals, numeric, roles, context, total_rows, ctx, payload) {
+    let item = payload.item;
+    if item.kind == "group" {
+        let indicator = image_source(asset(if item.collapsed {
+                "app/icons/chevron_right"
+            } else { "app/icons/disclosure_down" }))
+            .with_key(`${payload.key}-indicator`)
+            .with_style(ctx.component_style("group_indicator", style()
+                .width(theme_length("metrics.icon")).height(theme_length("metrics.icon"))
+                .text_color(theme_color("text_muted"))));
+        // A group header is structure, not data: the label voice, like the column headers.
+        let label = text(item.group.to_upper()).with_key(`${payload.key}-label`)
+            .with_style(ctx.component_style("group_label",
+                style().flex_grow().typography("label").text_color(theme_color("text_muted"))));
+        let count = text(`${item.count}`).with_key(`${payload.key}-count`)
+            .with_style(ctx.component_style("group_count", style().typography("label")
+                .text_color(theme_color("text_muted"))));
+        let node = row([indicator, label, count])
+            .with_key(payload.key)
+            .with_style(ctx.component_style("group_header",
+                style().height(theme_length("metrics.row")).padding_x(theme_length("metrics.inset"))
+                    .gap(theme_spacing("xs"))
+                    .items_center().border_bottom(px(1)).border_color(theme_color("border"))
+                    .background(theme_color("surface_raised")).occlude_except_scroll()))
+            .accessibility_role("rowheader")
+            .accessibility_label(`${item.group}, ${item.count}`)
+            .accessibility_row_index(payload.index + 2)
+            .accessibility_expanded(!item.collapsed);
+        return if item.toggle {
+            node.on_click_value(Fn("group_action"), item.group)
+        } else { node.tab_stop(false) };
+    }
+    let cells = [];
+    let cell_index = 1;
+    for cell in item.cells {
+        // A status column shows only its badge: when the column has no value of its
+        // own, or its badge already says it.
+        let content = [];
+        let labels = [];
+        let repeated = false;
+        for adornment in cell.adornments { if adornment.text == cell.text { repeated = true; } }
+        if (cell.text != "" && !repeated) || cell.adornments.len == 0 {
+            content.push(text(cell.text).with_key(`${cell.key}-text`)
+                .with_style(style().min_width(px(0)).whitespace_nowrap().text_ellipsis()));
+            labels.push(cell.text);
+        }
+        for index in 0..cell.adornments.len {
+            let adornment = cell.adornments[index];
+            // Rows render as separate virtual items: the instance key carries the row.
+            content.push(badge::Badge(#{ key: `${payload.key}-${cell.key}-adornment-${index}`,
+                text: adornment.text, variant: adornment.variant,
+                dot: adornment.dot, size: "sm" }).with_key(`${cell.key}-adornment-${index}`));
+            labels.push(adornment.text);
+        }
+        let cell_label = labels.reduce(|label, part| if label == () { part } else { `${label}, ${part}` });
+        if cell_label == () { cell_label = ""; }
+        if "resize_signal_key" in cell {
+            content.push(intrinsic_column_measure(
+                `${payload.key}-${cell.key}-measure`, cell.text,
+                resize_signals[cell.key], 0.0));
+        }
+        let cell_style = column_style(cell).height(theme_length("metrics.row")).min_width(px(0))
+            .overflow_hidden().items_center().gap(theme_spacing("sm"))
+            .whitespace_nowrap().text_ellipsis().typography("body");
+        if cell.key in numeric { cell_style = cell_style.font_feature("tnum", 1); }
+        if cell.key in roles { cell_style = cell_style.typography(roles[cell.key]); }
+        let node = row(content).with_key(cell.key).with_style(
+            ctx.component_style(if item.selected { "row_selected" } else { "row" }, cell_style));
+        if context {
+            let select = if item.selection == () || item.selected { () } else { [payload.key] };
+            node = node.on("pointer_down", Fn("cell_context")
+                .curry(#{ key: payload.key, column: cell.key, select: select }));
+        }
+        node = node.with_table_column(cell_index - 1);
+        node = node.accessibility_table_cell(cell_label, cell_index);
+        cells.push(node);
+        cell_index += 1;
+    }
+    // Selection is the table selection tint plus the 2px indicator bar on the row start;
+    // while the table has keyboard focus the selected row also shows the focus frame.
+    if item.selected {
+        cells.push(row([]).with_style(ctx.component_style("indicator_bar", style()
+            .absolute().inset_start(px(0)).top(px(0)).bottom(px(0))
+            .width(px(2)).background(theme_color("accent")))));
+        cells.push(row([]).with_style(ctx.component_style("cursor", style()
+            .absolute().left(px(0)).right(px(0)).top(px(0)).bottom(px(0))
+            .border(px(2)).border_color(rgba(0x00000000))
+            .group_focus(style().border_color(theme_color("focus_ring"))))));
+    }
+    let base = style().width(relative(1.0))
+        .height(theme_length("metrics.row")).items_center()
+        .overflow_hidden()
+        .text_color(theme_color("text_primary"))
+        .border_bottom(px(1)).border_color(theme_color("border"))
+        .background(if item.selected { theme_color("table.selection") }
+            else if item.striped { theme_color("surface_raised") }
+            else { rgba(0x00000000) });
+    if !item.selected {
+        base = base.hover(style().background(theme_color("surface_hover")));
+    }
+    let node = row(cells)
+        .with_key(payload.key)
+        .with_style(ctx.component_style(if item.selected { "row_selected" } else { "row" }, base))
+        .accessibility_table_row(item.label, item.selected,
+            payload.index + 2, payload.index + 1, total_rows);
+    // A column in its own role (mono identifiers at the code size) is sized to sit with
+    // the body text on purpose.
+    if roles.len() > 0 { node = node.audit_allow(["mixed-type-in-row"]); }
+    // A row is a pointer target only: the table is the one tab stop, and its keys move
+    // the selection.
+    node.on_click_value(Fn("row_action"), #{ key: payload.key, selection: item.selection })
+        .tab_stop(false)
+}
+
+fn table_row_item(source, source_index, columns, row_key, label, selected,
+        selection_mode, striped, row_height, display_index) {
+    let key = `${source[row_key]}`;
+    let is_selected = key in selected;
+    let next_selection = if selection_mode == "none" { () }
+        else if selection_mode == "single" { if is_selected { [] } else { [key] } }
+        else {
+            let result = [];
+            for candidate in selected { if candidate != key { result.push(candidate); } }
+            if !is_selected { result.push(key); }
+            result
+        };
+    let cells = [];
+    for column in columns {
+        let adornments = [];
+        for spec in prop_or(column, "adornments", []) {
+            let adornment_text = if spec.text_key in source { `${source[spec.text_key]}` } else { "" };
+            if adornment_text != "" {
+                let variant = if "variant_key" in spec && spec.variant_key != () && spec.variant_key in source {
+                    `${source[spec.variant_key]}`
+                } else { prop_or(spec, "variant", "neutral") };
+                if !(variant in ["neutral", "accent", "success", "warning", "danger"]) {
+                    throw `Table row ${source_index} adornment variant ${variant} is invalid`;
+                }
+                adornments.push(#{ text: adornment_text, variant: variant, dot: prop_or(spec, "dot", false) });
+            }
+        }
+        let cell = #{
+            key: column.key, text: if column.key in source { `${source[column.key]}` } else { "" },
+            width: column.width, align: prop_or(column, "align", "start"), adornments: adornments,
+        };
+        if "resize_signal_key" in column {
+            cell.resize_signal_key = column.resize_signal_key;
+        }
+        cells.push(cell);
+    }
+    #{ kind: "row", key: key, label: `${label} row ${source_index + 1}`, cells: cells,
+        selected: is_selected, selection: next_selection,
+        striped: striped && display_index % 2 == 1, height: row_height }
+}
+
+fn unique_group_header_key(value, row_keys, header_keys) {
+    let key = `__gpui_rhai_group__:${value}`;
+    while key in row_keys || key in header_keys { key = `_${key}`; }
+    key
+}
+
+fn table_row_matches(source, query, search_fields) {
+    if query == "" { return true; }
+    for field in search_fields {
+        if field in source && `${source[field]}`.to_lower().contains(query) { return true; }
+    }
+    false
+}
+
+fn table_array_page(rows, query, search_fields, page, page_size) {
+    let filtered = [];
+    for index in 0..rows.len {
+        if table_row_matches(rows[index], query, search_fields) {
+            filtered.push(#{ source: rows[index], index: index });
+        }
+    }
+    if page_size == () { return filtered; }
+    let start = (page - 1) * page_size;
+    if start >= filtered.len { return []; }
+    let end = if start + page_size < filtered.len { start + page_size } else { filtered.len };
+    let paged = [];
+    for index in start..end { paged.push(filtered[index]); }
+    paged
+}
+
+fn table_column_model(props) {
+    let table_resizable = prop_or(props, "resizable_columns", false);
+    let requested = false;
+    for index in 0..props.columns.len {
+        if optional_or(props.columns[index], "resizable", table_resizable) { requested = true; }
+    }
+    if !requested { return #{ columns: normalized_columns(props.columns), signals: [], resize_signals: #{} }; }
+    let column_keys = [];
+    let columns = [];
+    let resize_signals = [];
+    let resize_signal_map = #{};
+    for index in 0..props.columns.len {
+        let source = props.columns[index];
+        if source.key in column_keys { throw `Table column key ${source.key} is duplicated`; }
+        column_keys.push(source.key);
+        // Every column can be resized, including the last one: widening it scrolls the table
+        // horizontally (the root already scrolls on x), narrowing it leaves space on the right.
+        let enabled = optional_or(source, "resizable", table_resizable);
+        let column = #{
+            key: source.key, title: source.title, width: source.width,
+            align: optional_or(source, "align", if prop_or(source, "numeric", false) { "end" } else { "start" }),
+            sortable: prop_or(source, "sortable", false),
+            resize_enabled: enabled, adornments: prop_or(source, "adornments", []),
+        };
+        if enabled {
+            let min_width = optional_or(source, "min_width", 48.0);
+            let max_width = if "max_width" in source { source.max_width } else { () };
+            if max_width != () && max_width < min_width {
+                throw `Table column ${source.key} max_width must be at least min_width`;
+            }
+            let signal_key = `column-width-${index}`;
+            column.resize_signal_key = signal_key;
+            column.resize_ref_key = `column-header-${index}`;
+            column.min_width = min_width;
+            column.max_width = max_width;
+            let resize_signal = optional_float_signal(signal_key);
+            resize_signals.push(resize_signal);
+            resize_signal_map[source.key] = resize_signal;
+        } else { resize_signals.push(()); }
+        columns.push(column);
+    }
+    #{ columns: columns, signals: resize_signals, resize_signals: resize_signal_map }
+}
+
+// The handle sits at the column's logical end, independent of cell padding and RTL.
+// Inner handles paint at the next header's inline start so they overlay both cells.
+// The last handle stays inside its own header's inline end.
+fn table_resize_handle(ctx, table_key, column, index, signal, header_ref, emit_resize, edge) {
+    let base = style().absolute().top(px(0)).width(px(8)).height(relative(1.0)).cursor_resize_x()
+        .focus(style().background(theme_color("selection")));
+    base = if edge == "start" { base.inset_start(offset_px(-4)) } else { base.inset_end(px(0)) };
+    let key_payload = #{ column_key: column.key,
+        signal_key: column.resize_signal_key, ref_key: column.resize_ref_key,
+        min_width: column.min_width, max_width: column.max_width, delta: -8.0,
+        controlled: emit_resize };
+    let resize_props = #{ key: `${table_key}-column-resize-${index}`,
+        column_key: column.key, source_kind: column.width.kind,
+        source_value: column.width.value, min_width: column.min_width,
+        signal: signal, column_ref: header_ref };
+    if emit_resize { resize_props.on_resize = Fn("column_resize_action"); }
+    if column.max_width != () { resize_props.max_width = column.max_width; }
+    let handle = gpui_rhai::ColumnResizePrimitive(resize_props)
+        .with_key(`${table_key}-column-resize-${index}`)
+        .with_ref(element_ref(`${table_key}-column-resize-${index}-handle`))
+        .with_style(ctx.component_style("resize_handle", base))
+        .tab_stop(true).accessibility_role("separator")
+        .accessibility_label(`Resize ${column.title} column`)
+        .accessibility_orientation("vertical")
+        .on_key_value("left", Fn("column_resize_key"), key_payload);
+    key_payload.delta = 8.0;
+    handle.on_key_value("right", Fn("column_resize_key"), key_payload)
+}
+
+fn table_header(ctx, props, columns, resize_signals, current_sort) {
+    let headers = [];
+    let emit_resize = "on_column_resize" in props && props.on_column_resize != ();
+    let last = columns.len - 1;
+    // One ref per resizable header cell: the cell binds it and the handle that resizes the
+    // column (which lives in the next cell) measures through it. A ref key may be declared
+    // only once per render.
+    let refs = [];
+    for column in columns {
+        refs.push(if prop_or(column, "resize_enabled", false) { element_ref(column.resize_ref_key) } else { () });
+    }
+    for index in 0..columns.len {
+        let column = columns[index];
+        let resize_enabled = prop_or(column, "resize_enabled", false);
+        let resize_signal = if resize_enabled { resize_signals[index] } else { () };
+        // Header cells speak in the label voice.
+        let content = [text(column.title.to_upper()).with_style(style()
+            .min_width(px(0)).whitespace_nowrap().text_ellipsis())];
+        if resize_enabled {
+            content.push(intrinsic_column_measure(
+                `${props.key}-${column.key}-header-measure`, column.title,
+                resize_signal, if optional_or(column, "sortable", false) { 19.0 } else { 0.0 }));
+        }
+        if current_sort != () && current_sort.key == column.key {
+            content.push(image_source(asset(if current_sort.direction == "ascending" {
+                    "app/icons/sort_ascending"
+                } else { "app/icons/sort_descending" }))
+                .with_style(style().width(theme_length("metrics.icon")).height(theme_length("metrics.icon"))
+                    .text_color(theme_color("text_primary"))));
+        }
+        let content_style = style().flex_grow().min_width(px(0)).height(relative(1.0)).items_center()
+            .gap(theme_spacing("xs"));
+        let align = optional_or(column, "align", "start");
+        if align == "end" { content_style = content_style.justify_end(); }
+        else if align == "center" { content_style = content_style.justify_center(); }
+        let children = [row(content).with_style(content_style)];
+        let header_ref = refs[index];
+        if index > 0 && prop_or(columns[index - 1], "resize_enabled", false) {
+            children.push(table_resize_handle(ctx, props.key, columns[index - 1], index - 1,
+                resize_signals[index - 1], refs[index - 1], emit_resize, "start"));
+        }
+        if index == last && resize_enabled {
+            children.push(table_resize_handle(
+                ctx, props.key, column, index, resize_signal, header_ref, emit_resize, "end"));
+        }
+        let header_style = column_style(column).relative().min_width(px(0))
+            .height(theme_length("metrics.row")).items_center()
+            .typography("label").text_color(theme_color("text_muted"));
+        if optional_or(column, "sortable", false) {
+            header_style = header_style.hover(style().background(theme_color("surface_hover"))
+                .text_color(theme_color("text_primary")));
+        }
+        let cell = row(children).with_key(column.key)
+            .with_style(ctx.component_style("header_cell", header_style))
+            .accessibility_column_header(column.title, index + 1);
+        cell = cell.with_table_column(index);
+        if resize_enabled {
+            cell = cell.with_ref(header_ref);
+        }
+        headers.push(if optional_or(column, "sortable", false) {
+            cell.on_click_value(Fn("sort_action"), next_sort(current_sort, column.key))
+        } else { cell });
+    }
+    row(headers).with_key(`${props.key}-header`)
+        // Unfilled like the rows, so it takes the color of the layer the table sits on (a
+        // Dialog, Sheet or Popover is surface_raised); rows never scroll under it.
+        .with_style(ctx.component_style("header", style().height(theme_length("metrics.row")).items_center()
+            .border_bottom(px(1)).border_color(theme_color("border"))))
+        .accessibility_role("row")
+        .accessibility_row_index(1)
+}
+
+fn table_shell(ctx,props,columns,signals,header,body,row_count,framed) {
+    let root_style=if prop_or(props,"fill_height",false) {
+        style().flex_col().flex_grow().min_width(px(0)).min_height(px(0)).overflow_x_scroll()
+    }else{style().flex_col().min_width(px(0)).overflow_x_scroll()};
+    box([header,body,table_focus_frame(ctx,framed)]).with_key(props.key).with_table_track(columns,signals)
+        .with_style(ctx.component_style("root",root_style.relative().focus(style())))
+        .accessibility_role("table").accessibility_label(props.label)
+        .accessibility_row_count(row_count).accessibility_column_count(columns.len)
+}
+
+// The 2px container frame over the table's edge while the table holds focus with no
+// current row to show where the keys act (no selection mode, or nothing selected); a
+// current row shows its own cursor instead.
+fn table_focus_frame(ctx, framed) {
+    let frame = style().absolute().left(px(0)).right(px(0)).top(px(0)).bottom(px(0))
+        .border(px(2)).border_color(rgba(0x00000000));
+    if framed { frame = frame.group_focus(style().border_color(theme_color("focus_ring"))); }
+    row([]).with_style(ctx.component_style("focus_frame", frame))
+}
+
+// One tab stop for the rows: arrows move the selection, Enter activates the row.
+// Keyboard targets of displayed array rows, by the rule native_table_neighbors applies to
+// a NativeCollection: the current row is the first displayed selected row; Up and Down
+// move one row and stop at the ends, and go to the first row when none is current.
+fn row_neighbors(keys, selected) {
+    if keys.len == 0 { return #{ first: (), last: (), previous: (), next: (), current: () }; }
+    let current = -1;
+    for index in 0..keys.len { if current < 0 && keys[index] in selected { current = index; } }
+    let previous = if current <= 0 { 0 } else { current - 1 };
+    let next = if current < 0 { 0 } else if current + 1 < keys.len { current + 1 } else { current };
+    #{ first: keys[0], last: keys[keys.len - 1], previous: keys[previous], next: keys[next],
+        current: if current >= 0 { keys[current] } else { () } }
+}
+
+// The display index of the row with this key, for its bounds.
+fn row_index(data, key) {
+    if key == () { return (); }
+    for index in 0..data.len { if data[index].kind == "row" && data[index].key == key { return index; } }
+    ()
+}
+
+fn with_row_keys(table, neighbors) {
+    if neighbors == () || neighbors.first == () { return table; }
+    let node = table.tab_stop(true)
+        .on_key_value("up", Fn("keyboard_select"), neighbors.previous)
+        .on_key_value("down", Fn("keyboard_select"), neighbors.next)
+        .on_key_value("home", Fn("keyboard_select"), neighbors.first)
+        .on_key_value("end", Fn("keyboard_select"), neighbors.last);
+    if neighbors.current != () { node.on_key_value("enter", Fn("keyboard_activate"), neighbors.current) } else { node }
+}
+
+fn table_state_body(ctx,props,part,content) {
+    let base=if prop_or(props,"fill_height",false) {
+        style().flex_grow().min_width(px(0)).min_height(px(0))
+    }else{style().min_width(px(0)).height(px(props.height))};
+    content.with_style(ctx.component_style(part,base.padding_x(theme_length("metrics.inset"))
+        .padding_y(theme_spacing("md")).typography("body").text_color(theme_color("text_muted"))))
+}
+
+fn render_Table(ctx, props) {
+    let fill_height = prop_or(props, "fill_height", false);
+    let has_height = optional_or(props, "height", ()) != ();
+    if fill_height && has_height {
+        throw "Table accepts either height or fill_height, not both";
+    }
+    if !fill_height && !has_height {
+        throw "Table requires height or fill_height: true";
+    }
+    let current_sort = if "sort" in props { props.sort } else { () };
+    let model = table_column_model(props);
+    let columns = model.columns;
+    let header = table_header(ctx, props, columns, model.signals, current_sort);
+
+    if prop_or(props, "loading", false) {
+        let loading = if "loading_content" in props && props.loading_content != () {
+            props.loading_content
+        } else { text("Loading…") };
+        return table_shell(ctx,props,columns,model.signals,header,table_state_body(ctx,props,"loading",loading),1,false);
+    }
+    if props.rows.len == 0 {
+        let empty = if "empty" in props && props.empty != () { props.empty }
+            else { text(prop_or(props, "empty_text", "No results")) };
+        return table_shell(ctx,props,columns,model.signals,header,table_state_body(ctx,props,"empty",empty),1,false);
+    }
+
+    let selected = prop_or(props, "selected_keys", []);
+    let selection_mode = prop_or(props, "selection_mode", "none");
+    let row_height = prop_or(props, "estimated_row_height", 32.0);
+    let striped = prop_or(props, "striped", false);
+    let group_by = if "group_by" in props { props.group_by } else { () };
+    let collapsed = prop_or(props, "collapsed_groups", []);
+    if group_by == () && collapsed.len > 0 {
+        throw "Table collapsed_groups requires group_by";
+    }
+    if group_by != () {
+        let found = false;
+        for column in columns { if column.key == group_by { found = true; } }
+        if !found { throw `Table group_by ${group_by} is not a declared column`; }
+    }
+    let group_toggle = "on_group_toggle" in props && props.on_group_toggle != ();
+    let context = "on_context_request" in props && props.on_context_request != ();
+    let sticky_groups = prop_or(props, "sticky_group_headers", true);
+    let native_data = is_native_collection(props.rows);
+    let query = prop_or(props, "query", "").to_lower();
+    let search_fields = prop_or(props, "search_fields", []);
+    if query != "" && search_fields.len == 0 {
+        throw "Table non-empty query requires search_fields";
+    }
+    for field in search_fields {
+        let found = field == props.row_key;
+        for column in columns { if column.key == field { found = true; } }
+        if !found { throw `Table search field ${field} is not the row key or a declared column`; }
+    }
+    let page = prop_or(props, "page", 1);
+    let page_size = if "page_size" in props { props.page_size } else { () };
+    let array_rows = if native_data { [] }
+        else { table_array_page(props.rows, query, search_fields, page, page_size) };
+    let data;
+    let sticky_headers = [];
+    if native_data {
+        data = native_table_view(props.rows, #{
+            row_key: props.row_key, label: props.label, columns: columns,
+            selected_keys: selected, selection_mode: selection_mode,
+            striped: striped, row_height: row_height, sort: current_sort,
+            group_by: group_by, collapsed_groups: collapsed, group_toggle: group_toggle,
+            query: query, search_fields: search_fields, page: page, page_size: page_size,
+        });
+    } else if group_by == () {
+        data = [];
+        for display_index in 0..array_rows.len {
+            let row = array_rows[display_index];
+            data.push(table_row_item(row.source, row.index, columns, props.row_key,
+                props.label, selected, selection_mode, striped, row_height, display_index));
+        }
+    } else {
+        data = [];
+        let group_order = [];
+        let buckets = #{};
+        let row_keys = [];
+        for entry in array_rows {
+            let source = entry.source;
+            let index = entry.index;
+            let group = if group_by in source { source[group_by] } else { () };
+            if type_of(group) != "string" || group == "" {
+                throw `Table row ${index} group field ${group_by} must be a non-empty string`;
+            }
+            let key = `${source[props.row_key]}`;
+            row_keys.push(key);
+            if !(group in buckets) {
+                group_order.push(group);
+                buckets[group] = [];
+            }
+            let bucket = buckets[group];
+            bucket.push(#{ source: source, index: index });
+            buckets[group] = bucket;
+        }
+        let header_keys = [];
+        let display_index = 0;
+        for group in group_order {
+            let rows = buckets[group];
+            let header_key = unique_group_header_key(group, row_keys, header_keys);
+            header_keys.push(header_key);
+            sticky_headers.push(data.len);
+            let is_collapsed = group in collapsed;
+            data.push(#{ kind: "group", key: header_key, group: group, count: rows.len,
+                collapsed: is_collapsed, toggle: group_toggle, height: row_height });
+            if !is_collapsed {
+                for row in rows {
+                    data.push(table_row_item(row.source, row.index, columns, props.row_key,
+                        props.label, selected, selection_mode, striped, row_height, display_index));
+                    display_index += 1;
+                }
+            }
+        }
+    }
+    if data.len == 0 {
+        let empty = if "empty" in props && props.empty != () { props.empty }
+            else { text(prop_or(props, "empty_text", "No results")) };
+        return table_shell(ctx,props,columns,model.signals,header,table_state_body(ctx,props,"empty",empty),1,false);
+    }
+    let collection = #{
+        key: `${props.key}-body`, label: props.label, data: data,
+        estimated_height: row_height,
+        overdraw_pixels: row_height * 4.0,
+        alignment: "top", follow_tail: false
+    };
+    // Both data sources are keyboard operable; the current row stays revealed. A native
+    // collection finds its targets in native code, without enumerating rows in Rhai.
+    let neighbors = ();
+    if selection_mode != "none" {
+        if native_data {
+            neighbors = native_table_neighbors(data, selected);
+        } else {
+            let row_keys = [];
+            for item in data { if item.kind == "row" { row_keys.push(item.key); } }
+            neighbors = row_neighbors(row_keys, selected);
+        }
+        if neighbors.current != () { collection.reveal_key = neighbors.current; }
+    }
+    if !native_data || !sticky_groups { collection.sticky_headers = if sticky_groups { sticky_headers } else { [] }; }
+    if fill_height { collection.fill_height = true; }
+    else { collection.height = props.height; }
+    let body_style = if fill_height {
+        style().flex_grow().min_width(px(0)).min_height(px(0))
+    } else { style().min_width(px(0)) };
+    let body = virtual_collection(collection,
+        Fn("render_table_row").curry(model.resize_signals).curry(numeric_keys(columns))
+            .curry(column_typography(columns)).curry(context).curry(data.len))
+        .with_style(ctx.component_style("body", body_style));
+    let framed = if selection_mode == "none" { context }
+        else { neighbors != () && neighbors.first != () && neighbors.current == () };
+    let table = with_row_keys(table_shell(ctx,props,columns,model.signals,header,body,data.len+1,framed), neighbors);
+    if context && neighbors != () && neighbors.first != () {
+        let target = #{ key: neighbors.current, collection: collection.key,
+            index: if native_data { neighbors.current_index } else { row_index(data, neighbors.current) } };
+        table = table.on_key_value("shift+f10", Fn("keyboard_context"), target)
+            .on_key_value("menu", Fn("keyboard_context"), target);
+    } else if context && selection_mode == "none" {
+        // Without a selection mode there is no current row: the table is a tab stop for the
+        // keyboard request alone, which is for the whole table.
+        let target = #{ key: (), collection: collection.key, index: () };
+        table = table.tab_stop(true)
+            .on_key_value("shift+f10", Fn("keyboard_context"), target)
+            .on_key_value("menu", Fn("keyboard_context"), target);
+    }
+    table
+}

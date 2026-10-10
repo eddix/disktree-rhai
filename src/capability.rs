@@ -17,17 +17,16 @@ use std::time::{Duration, Instant};
 
 use gpui_rhai::{
     AsyncCapabilityHandler, CapabilityDescriptor, CapabilityHandler, CapabilityId,
-    CapabilityMethod, ComponentStateSchema, ScriptViewExtension, StateField,
-    StoreId, SubscriptionCapabilityHandler, SubscriptionWork, UiRuntimeState,
-    UiValue, ValueSchema, ObjectField,
+    CapabilityMethod, ComponentStateSchema, ObjectField, ScriptViewExtension, StateField, StoreId,
+    SubscriptionCapabilityHandler, SubscriptionWork, UiRuntimeState, UiValue, ValueSchema,
 };
 use semver::Version;
 
+use crate::engine::SharedTree;
 use crate::engine::insights::{self, Finding};
 use crate::engine::node::{Metric, Node, NodeKind};
 use crate::engine::scan::{ScanHandle, ScanOptions};
 use crate::engine::space;
-use crate::engine::SharedTree;
 
 /// How often the scan subscription reports progress.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -69,10 +68,7 @@ fn entry_value(node: &Node, index: usize) -> UiValue {
         ("files", number(node.files)),
         ("dirs", number(node.dirs)),
         ("modified", UiValue::Integer(node.modified)),
-        (
-            "category",
-            UiValue::String(node.category.key().to_owned()),
-        ),
+        ("category", UiValue::String(node.category.key().to_owned())),
         (
             "reclaim",
             match node.reclaim {
@@ -98,9 +94,7 @@ fn insight_value(candidate: &insights::Candidate) -> UiValue {
         Finding::Worktrees { count, oldest_days } => {
             ("worktrees", format!("{count} · oldest {oldest_days} d"))
         }
-        Finding::StaleExperiments { count } => {
-            ("stale_experiments", format!("{count} untouched"))
-        }
+        Finding::StaleExperiments { count } => ("stale_experiments", format!("{count} untouched")),
     };
     map(vec![
         (
@@ -136,12 +130,11 @@ impl SubscriptionCapabilityHandler for ScanCapability {
             Some(UiValue::String(path)) => PathBuf::from(path),
             _ => return Err("scan.start expects `path`".to_owned()),
         };
-        let flag = |name: &str| {
-            matches!(fields.get(name), Some(UiValue::Bool(true)))
-        };
+        let flag = |name: &str| matches!(fields.get(name), Some(UiValue::Bool(true)));
         let metric = match fields.get("metric") {
-            Some(UiValue::String(label)) => Metric::parse(label)
-                .ok_or_else(|| format!("unknown metric `{label}`"))?,
+            Some(UiValue::String(label)) => {
+                Metric::parse(label).ok_or_else(|| format!("unknown metric `{label}`"))?
+            }
             _ => Metric::Bytes,
         };
         let options = ScanOptions {
@@ -222,7 +215,10 @@ fn run_forwarder(
                     };
                     let done = map(vec![
                         ("type", UiValue::String("done".into())),
-                        ("root", UiValue::String(root_for_device.display().to_string())),
+                        (
+                            "root",
+                            UiValue::String(root_for_device.display().to_string()),
+                        ),
                         ("files", number(snapshot.files)),
                         ("dirs", number(snapshot.dirs)),
                         ("bytes", number(snapshot.bytes)),
@@ -248,9 +244,7 @@ fn run_forwarder(
                         ),
                         (
                             "insights",
-                            UiValue::Array(
-                                findings.iter().map(insight_value).collect(),
-                            ),
+                            UiValue::Array(findings.iter().map(insight_value).collect()),
                         ),
                         (
                             "elapsed_ms",
@@ -304,6 +298,7 @@ impl CapabilityHandler for TreeCapability {
             "path" => self.path(input),
             "resolve" => self.resolve(input),
             "matches" => self.matches_summary(input),
+            "kept" => self.kept(input),
             other => Err(format!("unknown disktree.tree method `{other}`")),
         }
     }
@@ -370,6 +365,50 @@ impl TreeCapability {
 
     /// The find field's live summary: how much the needle matches under
     /// `crumbs`, before Enter applies it to the layout.
+    /// Whether one tile stays lit while a needle is typed: the paint asks
+    /// per tile, and the filter cache makes each answer a lookup. Answers
+    /// `"whole"` (a match, or beneath one), `"holds"` (an ancestor of
+    /// matches), `"out"`, or `"none"` when nothing is filtered.
+    fn kept(&mut self, input: UiValue) -> Result<UiValue, String> {
+        let UiValue::Map(fields) = input else {
+            return Err("tree.kept expects a map".to_owned());
+        };
+        let needle = match fields.get("needle") {
+            Some(UiValue::String(needle)) => needle.clone(),
+            _ => return Err("tree.kept expects `needle`".to_owned()),
+        };
+        let base = match fields.get("base") {
+            Some(UiValue::Array(items)) => {
+                let mut crumbs = Vec::with_capacity(items.len());
+                for item in items {
+                    let UiValue::Integer(index) = item else {
+                        return Err("tree.kept `base` must be integers".to_owned());
+                    };
+                    crumbs.push(*index as usize);
+                }
+                crumbs
+            }
+            _ => return Err("tree.kept expects `base`".to_owned()),
+        };
+        let crumbs = crumbs_of(&fields)?;
+        let scanned = self.current()?;
+        if needle.trim().is_empty() {
+            return Ok(UiValue::String("none".to_owned()));
+        }
+        let Some(node) = scanned.node.resolve(&base) else {
+            return Ok(UiValue::String("none".to_owned()));
+        };
+        let answer = match self.filter_cache.matches_for(&scanned, &needle, &base, node) {
+            Some(found) => match found.keep(&crumbs) {
+                Some(crate::engine::filter::Keep::Whole) => "whole",
+                Some(crate::engine::filter::Keep::Partial { .. }) => "holds",
+                None => "out",
+            },
+            None => "none",
+        };
+        Ok(UiValue::String(answer.to_owned()))
+    }
+
     fn matches_summary(&mut self, input: UiValue) -> Result<UiValue, String> {
         let UiValue::Map(fields) = input else {
             return Err("tree.matches expects a map".to_owned());
@@ -415,8 +454,9 @@ impl TreeCapability {
             _ => return Err("tree.children expects `crumbs`".to_owned()),
         };
         let metric = match fields.get("metric") {
-            Some(UiValue::String(label)) => Metric::parse(label)
-                .ok_or_else(|| format!("unknown metric `{label}`"))?,
+            Some(UiValue::String(label)) => {
+                Metric::parse(label).ok_or_else(|| format!("unknown metric `{label}`"))?
+            }
             _ => Metric::Bytes,
         };
         let max = match fields.get("max") {
@@ -434,9 +474,7 @@ impl TreeCapability {
         // to what matched, everything else drops. A directory whose own name
         // matches shows its whole subtree, unfiltered (tobi's Keep::Whole).
         let needle = match fields.get("needle") {
-            Some(UiValue::String(needle)) if !needle.trim().is_empty() => {
-                Some(needle.clone())
-            }
+            Some(UiValue::String(needle)) if !needle.trim().is_empty() => Some(needle.clone()),
             _ => None,
         };
         if let Some(needle) = needle {
@@ -492,7 +530,7 @@ impl TreeCapability {
         metric: Metric,
         max: usize,
     ) -> Result<UiValue, String> {
-        use crate::engine::filter::{contains_ignoring_case, Keep};
+        use crate::engine::filter::{Keep, contains_ignoring_case};
 
         // A directory that itself matches shows everything beneath it.
         if contains_ignoring_case(&node.name, &needle) {
@@ -519,10 +557,7 @@ impl TreeCapability {
                             .collect(),
                     ),
                 ),
-                (
-                    "tail_count",
-                    number((ranked.len() - kept) as u64),
-                ),
+                ("tail_count", number((ranked.len() - kept) as u64)),
                 (
                     "tail_value",
                     number(
@@ -568,11 +603,17 @@ impl TreeCapability {
             }
         }
         ranked.sort_by(|left, right| {
-            right.4.cmp(&left.4).then_with(|| left.1.name.cmp(&right.1.name))
+            right
+                .4
+                .cmp(&left.4)
+                .then_with(|| left.1.name.cmp(&right.1.name))
         });
         let kept = ranked.len().min(max);
         let tail_count = ranked.len() - kept;
-        let tail_value = ranked[kept..].iter().map(|entry| entry.4).fold(0u64, u64::saturating_add);
+        let tail_value = ranked[kept..]
+            .iter()
+            .map(|entry| entry.4)
+            .fold(0u64, u64::saturating_add);
 
         Ok(map(vec![
             (
@@ -641,7 +682,10 @@ impl TreeCapability {
                 // treat it as gone rather than failing the whole resolve.
                 None => return Ok(UiValue::Null),
             };
-            let Some(index) = node.children.iter().position(|child| child.name.as_ref() == name)
+            let Some(index) = node
+                .children
+                .iter()
+                .position(|child| child.name.as_ref() == name)
             else {
                 return Ok(UiValue::Null);
             };
@@ -649,8 +693,49 @@ impl TreeCapability {
             crumbs.push(index);
         }
         Ok(UiValue::Array(
-            crumbs.into_iter().map(|index| UiValue::Integer(index as i64)).collect(),
+            crumbs
+                .into_iter()
+                .map(|index| UiValue::Integer(index as i64))
+                .collect(),
         ))
+    }
+}
+
+/// The `disktree.git` task capability: what git says about a checkout the
+/// selection lands on. `()` when the directory is not a checkout.
+struct GitCapability;
+
+impl AsyncCapabilityHandler for GitCapability {
+    fn start(&mut self, method: &str, input: UiValue) -> Result<gpui_rhai::TaskWork, String> {
+        if method != "status" {
+            return Err(format!("unknown disktree.git method `{method}`"));
+        }
+        let UiValue::String(path) = input else {
+            return Err("git.status expects a path string".to_owned());
+        };
+        Ok(gpui_rhai::TaskWork::new(move || {
+            let state = crate::engine::git::state(Path::new(&path));
+            let answer = match state {
+                None => UiValue::Null,
+                Some(state) => map(vec![
+                    (
+                        "changed",
+                        state.changed.map_or(UiValue::Null, |count| {
+                            UiValue::Integer(count as i64)
+                        }),
+                    ),
+                    ("stashes", UiValue::Integer(state.stashes as i64)),
+                    (
+                        "unpushed",
+                        state.unpushed.map_or(UiValue::Null, |count| {
+                            UiValue::Integer(count as i64)
+                        }),
+                    ),
+                    ("summary", UiValue::String(state.summary())),
+                ]),
+            };
+            Ok(answer)
+        }))
     }
 }
 
@@ -677,11 +762,20 @@ impl AsyncCapabilityHandler for OpenCapability {
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| target.to_path_buf())
             };
-            std::process::Command::new("xdg-open")
+            // Each platform's own way to show a path: `open` on macOS,
+            // `explorer` on Windows, `xdg-open` elsewhere.
+            #[cfg(target_os = "macos")]
+            let opener = "open";
+            #[cfg(target_os = "windows")]
+            let opener = "explorer";
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let opener = "xdg-open";
+            eprintln!("disktree-rhai: reveal spawned: {opener} {}", shown.display());
+            std::process::Command::new(opener)
                 .arg(&shown)
                 .spawn()
                 .map(|_| UiValue::Null)
-                .map_err(|error| format!("xdg-open {}: {error}", shown.display()))
+                .map_err(|error| format!("{opener} {}: {error}", shown.display()))
         }))
     }
 }
@@ -760,6 +854,10 @@ impl ScriptViewExtension for DisktreeExtension {
         let anything = ValueSchema::Map {
             values: Box::new(ValueSchema::UiValue),
         };
+        // Any-value schema for the derived-layout stores the skin keeps out
+        // of `layout` (G9: rhai's array budget is cumulative per store value,
+        // so the paint slots and the tile cache need values of their own).
+        let any = ValueSchema::UiValue;
         runtime
             .stores
             .declare(
@@ -782,7 +880,42 @@ impl ScriptViewExtension for DisktreeExtension {
                     ),
                     (
                         "cursor".to_owned(),
-                        StateField::new(anything, UiValue::Map(BTreeMap::new())),
+                        StateField::new(anything.clone(), UiValue::Map(BTreeMap::new())),
+                    ),
+                    // One cached mosaic paint per colour mode, keyed 0-2.
+                    (
+                        "paint0".to_owned(),
+                        StateField::new(any.clone(), UiValue::Null),
+                    ),
+                    (
+                        "paint1".to_owned(),
+                        StateField::new(any.clone(), UiValue::Null),
+                    ),
+                    (
+                        "paint2".to_owned(),
+                        StateField::new(any.clone(), UiValue::Null),
+                    ),
+                    // The one-slot (metric, depth, crumbs, size, filter)
+                    // tile cache: [key, tiles, by_key].
+                    (
+                        "cache".to_owned(),
+                        StateField::new(any.clone(), UiValue::Array(Vec::new())),
+                    ),
+                    // The crumb sibling menu: #{ parent, rows } while one ▾
+                    // is open — seeded with empty rows so render-time reads
+                    // never see a missing field.
+                    (
+                        "menu".to_owned(),
+                        StateField::new(any.clone(), UiValue::Map(BTreeMap::from([
+                            ("parent".to_owned(), UiValue::Array(Vec::new())),
+                            ("rows".to_owned(), UiValue::Array(Vec::new())),
+                        ]))),
+                    ),
+                    // Git state by crumb key: the selection panel's figures,
+                    // probed once per selection.
+                    (
+                        "git".to_owned(),
+                        StateField::new(any.clone(), UiValue::Map(BTreeMap::new())),
                     ),
                 ]))
                 .map_err(|error| error.to_string())?,
@@ -873,6 +1006,35 @@ impl ScriptViewExtension for DisktreeExtension {
                             },
                         ),
                         (
+                            "kept".to_owned(),
+                            CapabilityMethod {
+                                input: ValueSchema::Object {
+                                    fields: BTreeMap::from([
+                                        (
+                                            "base".to_owned(),
+                                            ObjectField::required(ValueSchema::Array {
+                                                items: Box::new(ValueSchema::integer()),
+                                                max_items: Some(512),
+                                            }),
+                                        ),
+                                        (
+                                            "crumbs".to_owned(),
+                                            ObjectField::required(ValueSchema::Array {
+                                                items: Box::new(ValueSchema::integer()),
+                                                max_items: Some(512),
+                                            }),
+                                        ),
+                                        (
+                                            "needle".to_owned(),
+                                            ObjectField::required(ValueSchema::string()),
+                                        ),
+                                    ]),
+                                    allow_unknown: false,
+                                },
+                                output: ValueSchema::string(),
+                            },
+                        ),
+                        (
                             "matches".to_owned(),
                             CapabilityMethod {
                                 input: ValueSchema::Object {
@@ -947,6 +1109,28 @@ impl ScriptViewExtension for DisktreeExtension {
             )
             .map_err(|e| e.to_string())?;
 
+        let git_id = CapabilityId::parse("disktree.git").map_err(|e| e.to_string())?;
+        runtime
+            .capabilities
+            .register_async(
+                CapabilityDescriptor {
+                    id: git_id,
+                    version: Version::new(1, 0, 0),
+                    methods: BTreeMap::from([(
+                        "status".to_owned(),
+                        CapabilityMethod {
+                            input: ValueSchema::string(),
+                            // () when not a checkout, else a map of figures.
+                            output: ValueSchema::Map {
+                                values: Box::new(ValueSchema::UiValue),
+                            },
+                        },
+                    )]),
+                },
+                GitCapability,
+            )
+            .map_err(|e| e.to_string())?;
+
         let args_id = CapabilityId::parse("disktree.args").map_err(|e| e.to_string())?;
         runtime
             .capabilities
@@ -954,24 +1138,24 @@ impl ScriptViewExtension for DisktreeExtension {
                 CapabilityDescriptor {
                     id: args_id,
                     version: Version::new(1, 0, 0),
-                methods: BTreeMap::from([
-                    (
-                        "get".to_owned(),
-                        CapabilityMethod {
-                            input: ValueSchema::Null,
-                            output: ValueSchema::Map {
-                                values: Box::new(ValueSchema::UiValue),
+                    methods: BTreeMap::from([
+                        (
+                            "get".to_owned(),
+                            CapabilityMethod {
+                                input: ValueSchema::Null,
+                                output: ValueSchema::Map {
+                                    values: Box::new(ValueSchema::UiValue),
+                                },
                             },
-                        },
-                    ),
-                    (
-                        "home".to_owned(),
-                        CapabilityMethod {
-                            input: ValueSchema::Null,
-                            output: ValueSchema::string(),
-                        },
-                    ),
-                ]),
+                        ),
+                        (
+                            "home".to_owned(),
+                            CapabilityMethod {
+                                input: ValueSchema::Null,
+                                output: ValueSchema::string(),
+                            },
+                        ),
+                    ]),
                 },
                 ArgsCapability {
                     args: self.args.clone(),
@@ -1001,9 +1185,7 @@ mod tests {
 
     fn map_get<'a>(value: &'a UiValue, key: &str) -> &'a UiValue {
         match value {
-            UiValue::Map(fields) => fields
-                .get(key)
-                .unwrap_or_else(|| panic!("no field {key}")),
+            UiValue::Map(fields) => fields.get(key).unwrap_or_else(|| panic!("no field {key}")),
             other => panic!("not a map: {other:?}"),
         }
     }
@@ -1095,7 +1277,10 @@ mod tests {
                 messages: Vec::new(),
             }),
         )));
-        let mut capability = TreeCapability { tree, filter_cache: FilterCache::default() };
+        let mut capability = TreeCapability {
+            tree,
+            filter_cache: FilterCache::default(),
+        };
 
         let reply = capability
             .call(
@@ -1113,9 +1298,15 @@ mod tests {
         };
         assert_eq!(entries.len(), 1, "the max window");
         // .cache (8 KiB) outranks src (4 KiB).
-        assert_eq!(map_get(&entries[0], "name"), &UiValue::String(".cache".into()));
+        assert_eq!(
+            map_get(&entries[0], "name"),
+            &UiValue::String(".cache".into())
+        );
         assert_eq!(map_get(&entries[0], "kind"), &UiValue::String("dir".into()));
-        assert_eq!(map_get(&entries[0], "category"), &UiValue::String("cache".into()));
+        assert_eq!(
+            map_get(&entries[0], "category"),
+            &UiValue::String("cache".into())
+        );
         // The tail merges what the window cut off.
         assert_eq!(map_get(&reply, "tail_count"), &UiValue::Integer(1));
         assert_eq!(map_get(&reply, "tail_value"), &UiValue::Integer(4096));
@@ -1134,7 +1325,10 @@ mod tests {
             UiValue::Array(entries) => entries.clone(),
             other => panic!("entries: {other:?}"),
         };
-        assert_eq!(map_get(&entries[0], "name"), &UiValue::String("blob.bin".into()));
+        assert_eq!(
+            map_get(&entries[0], "name"),
+            &UiValue::String("blob.bin".into())
+        );
         assert_eq!(
             map_get(&entries[0], "reclaim"),
             &UiValue::String("regenerable".into())

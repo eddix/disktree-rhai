@@ -7,7 +7,28 @@
 // primitives tobi uses — descend/ascend, geometric neighbour movement,
 // ranked sibling cycling, anchored zoom that enters a directory at its
 // ceiling and ascends at the floor, history on alt-arrows and side buttons.
-import "components/widgets" as w;
+// The chrome rides the official 0.2 component set (runtime API 3): buttons,
+// segmented toggles, checkboxes, progress, keycaps, badges, the spinner, the
+// status bar, plus the Toolbar layout and the Stat / Section /
+// DescriptionList patterns. The mosaic itself stays bespoke canvas — it is
+// the skin's own visualization, not a control.
+import "components/badge" as badge;
+import "components/button" as button;
+import "components/checkbox" as checkbox;
+import "components/divider" as divider;
+import "components/kbd" as kbd;
+import "components/popover" as popover;
+import "components/progress" as progress;
+import "components/select" as select;
+import "components/spinner" as spinner;
+import "components/status_bar" as status_bar;
+import "components/title_bar" as title_bar;
+import "components/toggle_group" as toggle_group;
+import "layouts/inline" as inline;
+import "layouts/toolbar" as toolbar;
+import "patterns/description_list" as description_list;
+import "patterns/section" as section;
+import "patterns/stat" as stat;
 import "core" as core;
 
 // ---------------------------------------------------------------------------
@@ -18,13 +39,21 @@ define_component(#{
     metadata: #{
         id: "skin/scan_root",
         "export": "ScanRoot",
-        version: "0.3.0",
-        runtime_api: #{ min_inclusive: 2, max_exclusive: 3 },
-        dependencies: ["skin/button"],
+        version: "0.4.0",
+        runtime_api: #{ min_inclusive: 3, max_exclusive: 4 },
+        dependencies: [
+            "components/badge", "components/button", "components/checkbox",
+            "components/divider", "components/kbd", "components/progress",
+            "components/popover", "components/select", "components/spinner",
+            "components/status_bar", "components/title_bar", "components/toggle_group",
+            "layouts/inline", "layouts/toolbar", "patterns/description_list", "patterns/section",
+            "patterns/stat",
+        ],
         capabilities: #{
             "disktree.scan": "*",
             "disktree.tree": "*",
             "disktree.open": "*",
+            "disktree.git": "*",
             "disktree.args": "*",
         },
     },
@@ -78,6 +107,38 @@ define_component(#{
                     schema: #{ type: "bool" },
                     "default": #{ type: "bool", value: false },
                 },
+                crumb_menu: #{
+                    schema: #{ type: "integer", min: -1, max: 63 },
+                    "default": #{ type: "integer", value: -1 },
+                },
+                crumb_menu_index: #{
+                    schema: #{ type: "integer", min: 0, max: 127 },
+                    "default": #{ type: "integer", value: 0 },
+                },
+                panel_width: #{
+                    schema: #{ type: "number", min: 272.0, max: 704.0 },
+                    "default": #{ type: "float", value: 368.0 },
+                },
+                panel_dragging: #{
+                    schema: #{ type: "bool" },
+                    "default": #{ type: "bool", value: false },
+                },
+                panel_anchor_x: #{
+                    schema: #{ type: "number" },
+                    "default": #{ type: "float", value: 0.0 },
+                },
+                panel_anchor_w: #{
+                    schema: #{ type: "number" },
+                    "default": #{ type: "float", value: 368.0 },
+                },
+                theme_open: #{
+                    schema: #{ type: "bool" },
+                    "default": #{ type: "bool", value: false },
+                },
+                theme_query: #{
+                    schema: #{ type: "string", max_length: 64 },
+                    "default": #{ type: "string", value: "" },
+                },
             },
         },
         events: #{},
@@ -124,7 +185,7 @@ fn scan_start(ctx, deps) {
         now: 0,
     });
     // A fresh scan invalidates the mosaic until it lands.
-    ctx.set_app_store("disktree", "layout", empty_layout());
+    reset_derived_layout(ctx);
     ctx.set_app_store(
         "disktree",
         "cursor",
@@ -169,7 +230,7 @@ fn scan_on_next(ctx, event) {
         scan.now = event.now;
         // A new tree invalidates the navigation crumbs and the mosaic, but
         // history survives: entries resolve lazily and prune themselves.
-        ctx.set_app_store("disktree", "layout", empty_layout());
+        reset_derived_layout(ctx);
         ctx.set_app_store("disktree", "scan", scan);
         return ();
     }
@@ -247,18 +308,49 @@ fn tile_lookup(layout, key) {
 /// the render projects each row through the view. Rows are plain data
 /// (the store cannot hold command objects); labels cache area-sorted
 /// candidate indices.
-fn build_paint(ctx, tiles, mode) {
+fn build_paint(ctx, tiles, mode, root_crumbs) {
     let light = is_light(ctx);
     let scan = ctx.get_app_store("disktree", "scan");
+    // While a needle is being typed, the engine says per tile whether it
+    // stays lit (a match, or beneath one) or dims toward the surface; Enter
+    // is what lands the filtered layout. The merged Others tail has no
+    // name of its own and always dims.
+    let needle = "";
+    if ctx.get_state("find_open") {
+        needle = ctx.get_state("find");
+    }
+    let out_keys = #{};
+    if needle.trim() != "" {
+        let i = 0;
+        while i < tiles.len() {
+            let tile = tiles[i];
+            let out = true;
+            if tile.kind != "others" {
+                let reply = ctx.call_capability("disktree.tree", "kept", #{
+                    base: root_crumbs,
+                    needle: needle,
+                    crumbs: tile.crumbs,
+                });
+                if reply != "out" {
+                    out = false;
+                }
+            }
+            if out {
+                out_keys[tile_key(tile)] = true;
+            }
+            i += 1;
+        }
+    }
     let base = [];
     let i = 0;
     while i < tiles.len() {
-        base = base + tile_base_commands(tiles[i], mode, light, scan.now);
+        base = base + tile_base_commands(tiles[i], mode, light, scan.now, out_keys);
         i += 1;
     }
     #{
         base: base,
         labels: sorted_label_candidates(tiles),
+        out_keys: out_keys,
     }
 }
 
@@ -305,12 +397,89 @@ fn empty_layout() {
         focused: false,
         filter: "",
         find_summary: (),
-        cache: [],
         by_key: #{},
         gen: 0,
-        paint_by_mode: #{ "0": (), "1": (), "2": () },
+        anim: anim_idle(),
     }
 }
+
+/// The paint slots and the one-slot tile cache live in their own app-store
+/// values, not inside the layout: rhai's array limit counts nested array
+/// elements cumulatively per store VALUE (docs/UPSTREAM_GAPS.md G9), and
+/// tiles + their crumb arrays + a cache slot + paint rows in one value
+/// crosses 10k on real trees. Reset together with the layout on every fresh
+/// scan.
+fn reset_derived_layout(ctx) {
+    ctx.set_app_store("disktree", "layout", empty_layout());
+    ctx.set_app_store("disktree", "paint0", ());
+    ctx.set_app_store("disktree", "paint1", ());
+    ctx.set_app_store("disktree", "paint2", ());
+    ctx.set_app_store("disktree", "cache", []);
+}
+
+/// The idle animation state.
+fn anim_idle() {
+    #{ active: false, from: core::view_identity(), step: 0, steps: 0 }
+}
+
+/// The view that makes `body` fill the viewport, centred on its middle:
+/// where a grown-into-place navigation starts (or ends, reversed).
+fn zoom_start(body, width, height) {
+    let scale = core::view_fit_scale(body, width, height);
+    if scale <= 1.05 {
+        return ();
+    }
+    #{
+        scale: scale,
+        ox: body.x + body.w / 2.0 - (width / 2.0) / scale,
+        oy: body.y + body.h / 2.0 - (height / 2.0) / scale,
+    }
+}
+
+/// Ease-out cubic for the zoom steps.
+fn anim_ease(t) {
+    let inv = 1.0 - t;
+    1.0 - inv * inv * inv
+}
+
+/// One view on the way from `from` to identity at fraction `t`.
+fn view_lerp(from, t) {
+    #{
+        scale: from.scale + (1.0 - from.scale) * t,
+        ox: from.ox * (1.0 - t),
+        oy: from.oy * (1.0 - t),
+    }
+}
+
+/// One 16ms step of a navigation transition: the view eases from the
+/// zoomed start toward identity, and the last step lands exactly on it.
+fn anim_tick(ctx, step) {
+    let layout = ctx.get_app_store("disktree", "layout");
+    let anim = layout.anim;
+    if !anim.active {
+        return ();
+    }
+    let next = step + 1;
+    if next >= anim.steps {
+        layout.view = core::view_identity();
+        layout.anim = anim_idle();
+        ctx.set_app_store("disktree", "layout", layout);
+        return ();
+    }
+    layout.view = view_lerp(anim.from, anim_ease(next.to_float() / anim.steps.to_float()));
+    anim.step = next;
+    layout.anim = anim;
+    ctx.set_app_store("disktree", "layout", layout);
+}
+
+/// A gesture (wheel, zoom keys) takes the view back: stop any transition.
+fn cancel_anim(ctx, layout) {
+    if layout.anim.active {
+        layout.anim = anim_idle();
+        ctx.set_app_store("disktree", "layout", layout);
+    }
+}
+
 
 // -- layout -------------------------------------------------------------------
 
@@ -331,10 +500,13 @@ fn layout_recompute(ctx, deps) {
     let previous = ctx.get_app_store("disktree", "layout");
     // 参数化缓存：同一 (metric, depth, crumbs, size, filter) 的往返切换
     // （t 循环、[/] 试深度）直接复用瓦片，重算只发生在真正新参数上。
+    // The one cache slot lives in its own store value (G9: array budgets are
+    // cumulative per store value).
     let cache_key = `${deps[2]}:${deps[3]}:${deps[1]}:${deps[4].to_int()}x${deps[5].to_int()}:${deps[6]}`;
+    let previous_cache = ctx.get_app_store("disktree", "cache");
     let cached = ();
     let kept_cache = [];
-    for slot in previous.cache {
+    for slot in previous_cache {
         if slot[0] == cache_key {
             cached = slot;
         } else {
@@ -346,17 +518,14 @@ fn layout_recompute(ctx, deps) {
         layout.tiles = cached[1];
         layout.by_key = cached[2];
         layout.gen += 1;
+        layout.valid = true;
+        layout.anim = anim_idle();
+        ctx.set_app_store("disktree", "layout", layout);
         // A restored layout invalidates every paint; rebuild the one the
         // user is actually looking at, or the next render is blank.
         let mode_now = ctx.get_state("mode");
-        layout.paint_by_mode = #{
-            "0": (),
-            "1": (),
-            "2": (),
-        };
-        layout.paint_by_mode[`${mode_now}`] = build_paint(ctx, layout.tiles, mode_now);
-        layout.valid = true;
-        ctx.set_app_store("disktree", "layout", layout);
+        reset_paint(ctx);
+        ctx.set_app_store("disktree", `paint${mode_now}`, build_paint(ctx, layout.tiles, mode_now, layout.crumbs));
         return ();
     }
     let crumbs = [];
@@ -370,6 +539,28 @@ fn layout_recompute(ctx, deps) {
         crumbs = previous.crumbs;
         view = previous.view;
     }
+    // Entering a directory: the transition starts zoomed on its tile in
+    // the old mosaic, so the new contents grow into place.
+    let anim_from = ();
+    if previous.valid && previous.crumbs.len() < crumbs.len()
+        && core::crumb_starts_with(crumbs, previous.crumbs)
+    {
+        let entered = tile_lookup(previous, crumb_key(crumbs));
+        if entered != () {
+            anim_from = zoom_start(core::tile_body(entered), width, height);
+        }
+    }
+    // The tile budget scales with the crumb depth: each tile carries its own
+    // crumb array, and rhai's array limit counts them cumulatively (G9), so
+    // a deep current directory earns fewer tiles.
+    let per_tile = crumbs.len() + deps[3] + 2;
+    let budget = 8500 / per_tile;
+    if budget > 2000 {
+        budget = 2000;
+    }
+    if budget < 250 {
+        budget = 250;
+    }
     let tiles = core::place_dir(
         ctx,
         crumbs,
@@ -378,7 +569,7 @@ fn layout_recompute(ctx, deps) {
         core::layout_options(deps[3]),
         0,
         deps[6],
-        2000
+        budget
     );
     let scan = ctx.get_app_store("disktree", "scan");
     let layout = empty_layout();
@@ -399,23 +590,39 @@ fn layout_recompute(ctx, deps) {
     layout.insights = insight_rows(ctx, scan.insights, deps[2]);
     layout.filter = filter;
     layout.find_summary = find_summary;
+    layout.by_key = tiles_by_key(tiles);
+    // Ascending: start zoomed on the directory just left, in the new
+    // mosaic, easing out to the whole view.
+    if anim_from == () && previous.valid && previous.crumbs.len() > crumbs.len()
+        && core::crumb_starts_with(previous.crumbs, crumbs)
+    {
+        let departed = tile_lookup(layout, crumb_key(previous.crumbs));
+        if departed != () {
+            anim_from = zoom_start(core::tile_body(departed), width, height);
+        }
+    }
+    if anim_from != () {
+        layout.view = anim_from;
+        let steps = ctx.motion_duration("normal") / 16;
+        if steps > 24 {
+            steps = 24;
+        }
+        if steps >= 2 {
+            layout.anim = #{ active: true, from: anim_from, step: 0, steps: steps };
+        }
+    }
     kept_cache.push([cache_key, tiles, layout.by_key]);
     while kept_cache.len() > 1 {
         kept_cache.remove(0);
     }
-    layout.cache = kept_cache;
-    layout.by_key = tiles_by_key(tiles);
+    ctx.set_app_store("disktree", "cache", kept_cache);
     layout.gen += 1;
     // Build the paint for the mode on screen, not always mode 0: a metric
     // switch re-runs this effect right after set_mode filled the new
     // mode's slot, and rebuilding only mode 0 would blank the mosaic.
     let mode_now = ctx.get_state("mode");
-    layout.paint_by_mode = #{
-        "0": (),
-        "1": (),
-        "2": (),
-    };
-    layout.paint_by_mode[`${mode_now}`] = build_paint(ctx, tiles, mode_now);
+    reset_paint(ctx);
+    ctx.set_app_store("disktree", `paint${mode_now}`, build_paint(ctx, tiles, mode_now, crumbs));
     ctx.set_app_store("disktree", "layout", layout);
     if focused {
         layout.focused = true;
@@ -427,6 +634,13 @@ fn layout_recompute(ctx, deps) {
         return ();
     }
     ctx.set_app_store("disktree", "layout", layout);
+}
+
+/// Empty the three paint slots (own store values, see reset_derived_layout).
+fn reset_paint(ctx) {
+    ctx.set_app_store("disktree", "paint0", ());
+    ctx.set_app_store("disktree", "paint1", ());
+    ctx.set_app_store("disktree", "paint2", ());
 }
 
 fn layout_stop(ctx, deps) {
@@ -575,7 +789,10 @@ fn nav_ascend(ctx) {
 /// A jump from the breadcrumb bar: no single region to move, it lands.
 fn nav_go_to(ctx, crumbs) {
     let layout = ctx.get_app_store("disktree", "layout");
-    if !layout.valid || !core::crumb_starts_with(crumbs, layout.crumbs) {
+    // Breadcrumb jumps go both down and UP within the scanned tree; the
+    // crumb path always addresses a node inside it, so validity is the
+    // only guard.
+    if !layout.valid {
         return ();
     }
     if crumb_key(crumbs) != layout.nav_key {
@@ -766,6 +983,7 @@ fn set_selection(ctx, crumbs) {
     let cursor = ctx.get_app_store("disktree", "cursor");
     cursor.selected = crumbs;
     ctx.set_app_store("disktree", "cursor", cursor);
+    ensure_git(ctx, crumbs);
 }
 
 fn deactivate_pointer(ctx) {
@@ -787,6 +1005,7 @@ fn zoom_at(ctx, x, y, factor, descend) {
     if !layout.valid {
         return ();
     }
+    layout.anim = anim_idle();
     let view = layout.view;
     if factor < 1.0 && view.scale <= 1.0 + 0.000001 {
         if descend {
@@ -838,6 +1057,7 @@ fn zoom_reset(ctx, payload) {
         return ();
     }
     layout.view = core::view_identity();
+    layout.anim = anim_idle();
     ctx.set_app_store("disktree", "layout", layout);
 }
 
@@ -847,10 +1067,18 @@ fn zoom_reset(ctx, payload) {
 /// the payload.
 fn on_key(ctx, name) {
     let scan = ctx.get_app_store("disktree", "scan");
+    if ctx.get_state("panel_dragging") && name == "escape" {
+        ctx.set_state("panel_dragging", false);
+        return ();
+    }
     if ctx.get_state("help_open") {
         if name == "escape" || name == "?" || name == "q" {
             ctx.set_state("help_open", false);
         }
+        return ();
+    }
+    if ctx.get_state("crumb_menu") >= 0 {
+        crumb_menu_key(ctx, name);
         return ();
     }
     // The find field owns the keyboard while it is open: no editor state to
@@ -874,6 +1102,11 @@ fn on_key(ctx, name) {
         }
         return ();
     }
+    on_key_navigation(ctx, name);
+}
+
+/// Movement, filter, escape cascade — the keys that walk the tree.
+fn on_key_navigation(ctx, name) {
     if name == "enter" {
         nav_descend(ctx);
     } else if name == "left" || name == "h" {
@@ -891,17 +1124,28 @@ fn on_key(ctx, name) {
     } else if name == "/" || name == "s" {
         ctx.set_state("find_open", true);
     } else if name == "escape" {
-        let layout = ctx.get_app_store("disktree", "layout");
-        let cursor = ctx.get_app_store("disktree", "cursor");
-        // A filter is the first thing Escape takes away.
-        if layout.filter != "" {
-            clear_filter(ctx);
-        } else if cursor.selected != () {
-            set_selection(ctx, ());
-        } else {
-            nav_ascend(ctx);
-        }
-    } else if name == "[" {
+        on_key_escape(ctx);
+    } else {
+        on_key_actions(ctx, name);
+    }
+}
+
+/// Escape cascades: filter → selection → ascend.
+fn on_key_escape(ctx) {
+    let layout = ctx.get_app_store("disktree", "layout");
+    let cursor = ctx.get_app_store("disktree", "cursor");
+    if layout.filter != "" {
+        clear_filter(ctx);
+    } else if cursor.selected != () {
+        set_selection(ctx, ());
+    } else {
+        nav_ascend(ctx);
+    }
+}
+
+/// View and mode keys — the keys that change what is shown.
+fn on_key_actions(ctx, name) {
+    if name == "[" {
         adjust_depth(ctx, -1);
     } else if name == "]" {
         adjust_depth(ctx, 1);
@@ -916,21 +1160,25 @@ fn on_key(ctx, name) {
     } else if name == "r" {
         scan_again(ctx, ());
     } else if name == "i" {
-        let hidden = ctx.get_state("no_hidden");
-        ctx.set_state("no_hidden", !hidden);
+        toggle_state(ctx, "no_hidden");
     } else if name == "d" {
-        let apparent = ctx.get_state("apparent");
-        ctx.set_state("apparent", !apparent);
+        toggle_state(ctx, "apparent");
     } else if name == "p" {
-        let open = ctx.get_state("sidebar_open");
-        ctx.set_state("sidebar_open", !open);
+        toggle_state(ctx, "sidebar_open");
     } else if name == "o" {
         reveal_target(ctx);
+    } else if name == "e" {
+        cycle_theme(ctx);
     } else if name == "?" {
         ctx.set_state("help_open", true);
     } else if name == "q" {
         ctx.close_window(ctx.window_id());
     }
+}
+
+/// Flip one boolean state field.
+fn toggle_state(ctx, field) {
+    ctx.set_state(field, !ctx.get_state(field));
 }
 
 /// `-` and `=` zoom on the centre, without the descend gesture.
@@ -966,11 +1214,10 @@ fn set_mode(ctx, mode) {
     // render never sees an empty slot.
     let layout = ctx.get_app_store("disktree", "layout");
     if layout.valid {
-        let slot = layout.paint_by_mode[`${mode}`];
+        let slot = ctx.get_app_store("disktree", `paint${mode}`);
         if slot == () {
-            layout.paint_by_mode[`${mode}`] = build_paint(ctx, layout.tiles, mode);
+            ctx.set_app_store("disktree", `paint${mode}`, build_paint(ctx, layout.tiles, mode, layout.crumbs));
         }
-        ctx.set_app_store("disktree", "layout", layout);
     }
     ctx.set_state("mode", mode);
     if mode == 1 {
@@ -1021,6 +1268,16 @@ fn reveal_failed(ctx, error) {
 fn find_refresh(ctx) {
     let find = ctx.get_state("find");
     let layout = ctx.get_app_store("disktree", "layout");
+    // Dimming follows the keystrokes: the on-screen mode's paint is rebuilt
+    // against the needle (or the lack of one) right away.
+    if layout.valid {
+        let mode_now = ctx.get_state("mode");
+        ctx.set_app_store(
+            "disktree",
+            `paint${mode_now}`,
+            build_paint(ctx, layout.tiles, mode_now, layout.crumbs)
+        );
+    }
     if find.trim() == "" || !layout.valid {
         layout.find_summary = ();
         ctx.set_app_store("disktree", "layout", layout);
@@ -1187,6 +1444,17 @@ fn on_pointer_down(ctx, event) {
         nav_history(ctx, false);
         return ();
     }
+    if button == "right" {
+        // Right-click reveals the tile under the pointer, like tobi's.
+        let layout = ctx.get_app_store("disktree", "layout");
+        if layout.valid && event.canvas_key != () {
+            let tile = tile_lookup(layout, key_tail(event.canvas_key));
+            if tile != () && tile.kind != "others" {
+                reveal_tile(ctx, tile.crumbs);
+            }
+        }
+        return ();
+    }
     if button != "left" {
         return ();
     }
@@ -1258,33 +1526,455 @@ fn on_wheel(ctx, event) {
     zoom_at(ctx, event.local.x, event.local.y, factor, true);
 }
 
+// -- git state --------------------------------------------------------------------
+
+/// Ask git about the selection once per crumb path: directories that are
+/// checkouts get their changes, stashes and unpushed commits in the panel.
+/// The cache is keyed by crumb key; "pending" marks an in-flight probe.
+fn ensure_git(ctx, crumbs) {
+    if crumbs == () || crumbs.len() == 0 {
+        return ();
+    }
+    let git = ctx.get_app_store("disktree", "git");
+    let key = crumb_key(crumbs);
+    if key in git {
+        return ();
+    }
+    let entry = node_entry(ctx, crumbs);
+    if entry == () || entry.kind != "dir" {
+        return ();
+    }
+    git[key] = "pending";
+    ctx.set_app_store("disktree", "git", git);
+    let path = current_path(ctx, crumbs);
+    ctx.start_task(
+        "disktree.git",
+        "status",
+        path,
+        Fn("git_done").curry(key),
+        Fn("git_failed")
+    );
+}
+
+fn git_done(key, ctx, state) {
+    let git = ctx.get_app_store("disktree", "git");
+    git[key] = state;
+    ctx.set_app_store("disktree", "git", git);
+}
+
+fn git_failed(ctx, error) {
+    ()
+}
+
+// -- crumb sibling menu -----------------------------------------------------------
+
+/// The ▾ beside a crumb: a Popover listing the crumb's siblings, largest
+/// first. Open state lives in `crumb_menu` (the crumb index, -1 closed) so
+/// the keyboard can drive it from the root handler.
+fn crumb_menu_toggle(ctx, index) {
+    popover::Popover(#{
+        key: `crumb-menu-${index}`,
+        label: "Sibling directories",
+        trigger: text("▾")
+            .with_style(
+                style()
+                    .font_size(px(9.0))
+                    .text_color(theme_color("text_muted"))
+                    .padding_x(theme_spacing("xxs"))
+                    .flex_shrink(false)
+            )
+            .on_click_value(Fn("crumb_menu_opened"), index),
+        content: crumb_menu_rows(ctx, index),
+        open: ctx.get_state("crumb_menu") == index,
+        placement: "bottom",
+        align: "start",
+        on_open_change: Fn("crumb_menu_open_change"),
+    })
+}
+
+/// The rows themselves, from the store cache the opener filled.
+fn crumb_menu_rows(ctx, index) {
+    let menu = ctx.get_app_store("disktree", "menu");
+    // The Popover content is built before any ▾ ever opens: the store may
+    // still hold an empty menu, and `for` over a missing field is an error.
+    if menu == () || !("rows" in menu) {
+        return box([])
+            .with_key("crumb-menu-rows")
+            .with_style(style().flex_col());
+    }
+    let highlight = ctx.get_state("crumb_menu_index");
+    let metric = ctx.get_state("metric");
+    let rows = [];
+    let position = 0;
+    for row in menu.rows {
+        let highlighted = position == highlight;
+        let value = if metric == "files" {
+            core::human_count(row.files)
+        } else {
+            core::human_bytes_short(row.bytes)
+        };
+        rows.push(
+            row([
+                text(row.name).with_style(
+                    style()
+                        .typography("body_small")
+                        .text_color(if highlighted { theme_color("text_primary") } else { theme_color("text_muted") })
+                        .overflow_hidden()
+                        .whitespace_nowrap().text_ellipsis()
+                        .max_width(px(200.0))
+                ),
+                share_bar(row.share, theme_color("accent")),
+                text(value).with_style(
+                    style().typography("caption").text_color(theme_color("text_muted"))
+                ),
+            ])
+            .with_key(`sibling-${row.index}`)
+            .on_click_value(Fn("crumb_menu_jump"), row.index)
+            .with_style(
+                style()
+                    .flex_row()
+                    .items_center()
+                    .gap(theme_length("space.related"))
+                    .width(px(300.0))
+                    .padding_x(theme_length("metrics.inset"))
+                    .min_height(theme_length("metrics.row"))
+                    .background(if highlighted { theme_color("surface_raised") } else { theme_color("surface") })
+                    .hover(style().background(theme_color("surface_raised")))
+            )
+        );
+        position += 1;
+    }
+    column(rows)
+        .with_key("crumb-menu-rows")
+        .with_style(
+            style()
+                .flex_col()
+                .max_height(px(352.0))
+                .overflow_y_scroll()
+        )
+}
+
+/// A ▾ was clicked (or the popover opened): fetch the crumb's siblings —
+/// the children of its parent — ranked, with each one's share.
+fn crumb_menu_opened(ctx, index) {
+    let layout = ctx.get_app_store("disktree", "layout");
+    if !layout.valid || index < 1 {
+        return ();
+    }
+    let parent = [];
+    let i = 0;
+    while i < index {
+        parent.push(layout.crumbs[i]);
+        i += 1;
+    }
+    let metric = ctx.get_state("metric");
+    let reply = ctx.call_capability("disktree.tree", "children", #{
+        crumbs: parent,
+        metric: metric,
+        max: 96,
+    });
+    let total = reply.tail_value;
+    for entry in reply.entries {
+        total += entry.bytes;
+    }
+    let rows = [];
+    for entry in reply.entries {
+        let share = 0.0;
+        if total > 0 {
+            share = entry.bytes.to_float() / total.to_float();
+        }
+        rows.push(#{
+            index: entry.index,
+            name: entry.name,
+            bytes: entry.bytes,
+            files: entry.files,
+            share: share,
+        });
+    }
+    ctx.set_app_store("disktree", "menu", #{ parent: parent, rows: rows });
+    ctx.set_state("crumb_menu", index);
+    ctx.set_state("crumb_menu_index", 0);
+}
+
+/// Native dismissal (outside click, escape in the overlay): fold it away.
+fn crumb_menu_open_change(ctx, open) {
+    if !open {
+        ctx.set_state("crumb_menu", -1);
+    }
+}
+
+/// A row was clicked: jump sideways to that sibling.
+fn crumb_menu_jump(ctx, entry_index) {
+    let menu = ctx.get_app_store("disktree", "menu");
+    ctx.set_state("crumb_menu", -1);
+    nav_go_to(ctx, menu.parent + [entry_index]);
+}
+
+/// Keys while the menu is open: it owns them.
+fn crumb_menu_key(ctx, name) {
+    let menu = ctx.get_app_store("disktree", "menu");
+    if name == "escape" {
+        ctx.set_state("crumb_menu", -1);
+        return ();
+    }
+    let count = menu.rows.len();
+    let index = ctx.get_state("crumb_menu_index");
+    if name == "up" {
+        if index > 0 {
+            ctx.set_state("crumb_menu_index", index - 1);
+        }
+        return ();
+    }
+    if name == "down" {
+        if index + 1 < count {
+            ctx.set_state("crumb_menu_index", index + 1);
+        }
+        return ();
+    }
+    if name == "enter" && count > 0 {
+        let row = menu.rows[index];
+        ctx.set_state("crumb_menu", -1);
+        nav_go_to(ctx, menu.parent + [row.index]);
+        return ();
+    }
+    ()
+}
+
+// -- themes ----------------------------------------------------------------------
+
+/// Every mounted palette: the skin's own two first (they are the defaults),
+/// then gpui-rhai's bundled set. Entries are [family, name, label]; the
+/// files live under themes/, mounted by the host at prepare time.
+/// `family::name`, the Select's value for one mounted variant.
+fn theme_key(family, name) {
+    `${family}::${name}`
+}
+
+/// One Select option from a loaded variant (D47: the runtime lists them).
+fn theme_option(variant) {
+    let label = if variant.family == variant.name {
+        variant.family
+    } else {
+        `${variant.family} ${variant.name}`
+    };
+    #{ value: theme_key(variant.family, variant.name), label: label }
+}
+
+/// Every mounted palette as Select options — straight from the runtime,
+/// never a hand-maintained table that can drift from what the host loaded.
+fn theme_options_from(ctx) {
+    let options = [];
+    for variant in ctx.theme_variants() {
+        options.push(theme_option(variant));
+    }
+    options
+}
+
+/// The variants themselves, for the cycle key: `e` wraps around.
+fn theme_variants_list(ctx) {
+    ctx.theme_variants()
+}
+
+/// The active variant as a Select value; "" before one resolves.
+fn theme_current(ctx) {
+    let variant = ctx.theme_variant();
+    if variant == () {
+        return "";
+    }
+    theme_key(variant.family, variant.name)
+}
+
+/// The theme picker in the controls row; the current value follows the
+/// resolved variant, so a system appearance flip moves it too.
+fn theme_select(ctx) {
+    select::Select(#{
+        key: "theme",
+        label: "Theme",
+        options: theme_options_from(ctx),
+        value: theme_current(ctx),
+        open: ctx.get_state("theme_open"),
+        query: ctx.get_state("theme_query"),
+        width: px(180.0),
+        part_styles: #{
+            trigger: style()
+                .background(rgba(0x00000000))
+                .border_color(rgba(0x00000000))
+                .hover(style().background(theme_color("surface_hover")))
+        },
+        on_change: Fn("theme_selected"),
+        on_open_change: Fn("theme_open_changed"),
+        on_query_change: Fn("theme_query_changed"),
+    })
+}
+
+fn theme_selected(ctx, value) {
+    if value == () {
+        return ();
+    }
+    for variant in theme_variants_list(ctx) {
+        if theme_key(variant.family, variant.name) == value {
+            ctx.set_theme(variant.family, variant.name);
+            repaint_after_theme(ctx);
+            break;
+        }
+    }
+    ctx.focus("root");
+}
+
+fn theme_open_changed(ctx, open) {
+    ctx.set_state("theme_open", open);
+}
+
+fn theme_query_changed(ctx, query) {
+    ctx.set_state("theme_query", query);
+}
+
+/// The panel's grab strip: press to start a drag (double press resets to
+/// the default width), styled as an ink bar while it is held.
+fn panel_handle(dragging) {
+    let edge = theme_color("border");
+    if dragging {
+        edge = theme_color("accent");
+    }
+    box([])
+        .with_key("panel-handle")
+        .on("pointer_down", Fn("panel_drag_start"))
+        .on("pointer_move", Fn("panel_drag_over"))
+        .on("pointer_up", Fn("panel_drag_end"))
+        .accessibility_role("separator")
+        .accessibility_label("Resize the side panel")
+        .accessibility_orientation("vertical")
+        .with_style(
+            style()
+                .width(px(8.0))
+                .height(relative(1.0))
+                .flex_shrink(false)
+                .border_start(px(1.0))
+                .border_color(edge)
+                .cursor_resize_x()
+                .hover(style().background(theme_color("surface_hover")))
+        )
+}
+
+fn clamp_panel_width(width) {
+    let value = width;
+    if value < 272.0 {
+        value = 272.0;
+    }
+    if value > 704.0 {
+        value = 704.0;
+    }
+    value
+}
+
+/// Press on the edge: a double press resets to the default, like tobi's.
+fn panel_drag_start(ctx, event) {
+    if event.click_count >= 2 {
+        ctx.set_signal("panel-width", ());
+        ctx.set_state("panel_width", 368.0);
+        ctx.set_state("panel_dragging", false);
+        return ();
+    }
+    ctx.set_state("panel_dragging", true);
+    ctx.set_state("panel_anchor_x", event.window.x);
+    ctx.set_state("panel_anchor_w", ctx.get_state("panel_width"));
+}
+
+/// A move while held: the panel follows the pointer, between its limits.
+fn panel_drag_move(ctx, event) {
+    if !ctx.get_state("panel_dragging") {
+        return ();
+    }
+    let width = ctx.get_state("panel_anchor_w")
+        - (event.window.x - ctx.get_state("panel_anchor_x"));
+    // The signal drives the width natively; no Rhai re-render per pixel.
+    ctx.set_signal("panel-width", clamp_panel_width(width));
+}
+
+fn panel_drag_over(ctx, event) {
+    panel_drag_move(ctx, event);
+}
+
+fn panel_drag_end(ctx, event) {
+    if ctx.get_state("panel_dragging") {
+        let final_width = ctx.get_signal("panel-width");
+        if final_width != () {
+            ctx.set_state("panel_width", final_width);
+        }
+        ctx.set_signal("panel-width", ());
+        ctx.set_state("panel_dragging", false);
+    }
+}
+
+/// A theme switch re-colours the mosaic: the paint rows carry resolved
+/// colours, so the on-screen mode's paint is rebuilt for the new palette.
+fn repaint_after_theme(ctx) {
+    let layout = ctx.get_app_store("disktree", "layout");
+    if layout.valid {
+        let mode_now = ctx.get_state("mode");
+        ctx.set_app_store(
+            "disktree",
+            `paint${mode_now}`,
+            build_paint(ctx, layout.tiles, mode_now, layout.crumbs)
+        );
+    }
+}
+
+/// `e`: the next palette, wrapping — the quick way to try them all.
+fn cycle_theme(ctx) {
+    let variant = ctx.theme_variant();
+    let current = "";
+    if variant != () {
+        current = theme_key(variant.family, variant.name);
+    }
+    let entries = theme_variants_list(ctx);
+    let next = 0;
+    let i = 0;
+    while i < entries.len() {
+        if theme_key(entries[i].family, entries[i].name) == current {
+            next = (i + 1) % entries.len();
+        }
+        i += 1;
+    }
+    let pick = entries[next];
+    ctx.set_theme(pick.family, pick.name);
+    repaint_after_theme(ctx);
+}
+
 // -- toolbar actions -------------------------------------------------------------
 
-fn toggle_hidden(ctx, payload) {
-    let hidden = ctx.get_state("no_hidden");
-    ctx.set_state("no_hidden", !hidden);
+/// The Open/Reveal buttons carry their crumbs through a curried callback:
+/// the curried arguments land ahead of (ctx, payload).
+fn open_clicked(crumbs, ctx, payload) {
+    nav_enter(ctx, crumbs);
 }
 
-fn toggle_apparent(ctx, payload) {
-    let apparent = ctx.get_state("apparent");
-    ctx.set_state("apparent", !apparent);
+fn reveal_clicked(crumbs, ctx, payload) {
+    reveal_tile(ctx, crumbs);
 }
 
-fn mode_clicked(ctx, mode) {
-    set_mode(ctx, mode);
-}
-
-fn depth_clicked(ctx, step) {
-    adjust_depth(ctx, step);
-}
-
-fn help_clicked(ctx, payload) {
-    let open = ctx.get_state("help_open");
-    ctx.set_state("help_open", !open);
+/// Reveal one crumb path in the file manager, shared by the panel button,
+/// the `o` key and a right-click on a tile.
+fn reveal_tile(ctx, crumbs) {
+    if crumbs == () || crumbs.len() == 0 {
+        return ();
+    }
+    let path = current_path(ctx, crumbs);
+    ctx.start_task(
+        "disktree.open",
+        "reveal",
+        path,
+        Fn("reveal_done"),
+        Fn("reveal_failed")
+    );
 }
 
 /// A crumb segment was clicked: jump there.
 fn crumb_clicked(ctx, index) {
+    if index < 0 {
+        nav_go_to(ctx, []);
+        return ();
+    }
     let layout = ctx.get_app_store("disktree", "layout");
     let crumbs = [];
     let i = 0;
@@ -1308,24 +1998,6 @@ fn insight_clicked(ctx, index) {
     if index >= 0 && index < layout.insights.len() {
         set_selection(ctx, layout.insights[index].crumbs);
     }
-}
-
-fn open_clicked(ctx, crumbs) {
-    nav_enter(ctx, crumbs);
-}
-
-fn reveal_clicked(ctx, crumbs) {
-    if crumbs == () || crumbs.len() == 0 {
-        return ();
-    }
-    let path = current_path(ctx, crumbs);
-    ctx.start_task(
-        "disktree.open",
-        "reveal",
-        path,
-        Fn("reveal_done"),
-        Fn("reveal_failed")
-    );
 }
 
 // -- rendering ----------------------------------------------------------------
@@ -1368,29 +2040,62 @@ fn render_ScanRoot(ctx, props) {
         Fn("layout_stop")
     );
 
+    // A navigation transition steps itself: while one runs, redeclare the
+    // timer with the next step number (the changed payload re-arms it).
+    if layout.anim.active {
+        timeout("nav-anim", 16, false, Fn("anim_tick"), layout.anim.step);
+    }
+
     // The resolved variant drives the canvas palette; the read is a tracked
     // theme dependency, so a system appearance flip re-renders the mosaic.
     let light = is_light(ctx);
-    let body = stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light);
+    // The active mode's paint, from its own store value (G9). `()` until the
+    // layout effect fills it; mosaic_nodes renders an empty mosaic then.
+    let paint = ctx.get_app_store("disktree", `paint${mode}`);
+    let body = stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light, paint);
+    // The panel owns its left edge: drag it to resize (SplitPane's handle),
+    // and below 52rem of window it gives the mosaic its room, like tobi's.
+    let viewport = ctx.viewport_class();
+    let root_ref = element_ref("root");
+    // The drag signal: pointer moves update it natively (no Rhai re-render);
+    // only the release commits to state.
+    let panel_drag_w = optional_float_signal("panel-width");
     let with_side = body;
-    if sidebar_open && layout.valid {
+    if sidebar_open && layout.valid && viewport != "compact" {
+        // The panel owns its left edge, hand-rolled: upstream's SplitPane
+        // drops absolutely-positioned content in its panels since the
+        // resize-grips rework (docs/UPSTREAM_GAPS.md G12) and the mosaic is
+        // all absolute overlays. Drag the edge; double-click resets it.
         with_side = row([
-            body.with_style(style().flex_grow().width(relative(1.0))),
-            sidebar(scan, layout, cursor, mode),
+            body.with_style(
+                style()
+                    .flex_grow()
+                    .width(relative(1.0))
+                    .min_width(px(0.0))
+            ),
+            panel_handle(ctx.get_state("panel_dragging")),
+            sidebar(
+                scan,
+                layout,
+                cursor,
+                mode,
+                ctx.get_app_store("disktree", "git"),
+                ctx.get_state("panel_width")
+            )
+            .bind_signal("width_override", panel_drag_w),
         ])
-        .with_style(style().flex_row().width(relative(1.0)).flex_grow());
+        .with_style(style().flex_row().width(relative(1.0)).flex_grow().min_height(px(0.0)));
     }
     let find = ctx.get_state("find");
-    let body_rows = [header(metric, apparent, no_hidden, depth, mode, layout)];
-    if find_open || layout.filter != "" {
-        body_rows.push(find_bar(find_open, find, layout));
-    }
-    body_rows.push(with_side);
-    body_rows.push(footer(scan, layout));
+    let body_rows = [
+        header(ctx, metric, apparent, no_hidden, depth, mode, layout, find_open, find, light, scan, viewport),
+        with_side,
+        footer(scan, layout),
+    ];
     with_keys(
         column(body_rows)
             .with_key("scan_root")
-            .with_ref(element_ref("root"))
+            .with_ref(root_ref)
             .with_style(
                 ctx.component_style(
                     "root",
@@ -1420,61 +2125,21 @@ fn view_size(bounds) {
 /// Every key the mosaic answers, attached to whichever node holds the
 /// viewport (the scan panel while reading, the mosaic afterwards).
 fn with_keys(node) {
-    node
-        .on_key_value("enter", Fn("on_key"), "enter")
-        .on_key_value("left", Fn("on_key"), "left")
-        .on_key_value("right", Fn("on_key"), "right")
-        .on_key_value("up", Fn("on_key"), "up")
-        .on_key_value("down", Fn("on_key"), "down")
-        .on_key_value("h", Fn("on_key"), "h")
-        .on_key_value("j", Fn("on_key"), "j")
-        .on_key_value("k", Fn("on_key"), "k")
-        .on_key_value("l", Fn("on_key"), "l")
-        .on_key_value("tab", Fn("on_key"), "tab")
-        .on_key_value("backspace", Fn("on_key"), "backspace")
-        .on_key_value("u", Fn("on_key"), "u")
-        .on_key_value("escape", Fn("on_key"), "escape")
-        .on_key_value("[", Fn("on_key"), "[")
-        .on_key_value("]", Fn("on_key"), "]")
-        .on_key_value("-", Fn("on_key"), "-")
-        .on_key_value("=", Fn("on_key"), "=")
-        .on_key_value("+", Fn("on_key"), "+")
-        .on_key_value("0", Fn("on_key"), "0")
-        .on_key_value("t", Fn("on_key"), "t")
-        .on_key_value("r", Fn("on_key"), "r")
-        .on_key_value("i", Fn("on_key"), "i")
-        .on_key_value("d", Fn("on_key"), "d")
-        .on_key_value("p", Fn("on_key"), "p")
-        .on_key_value("o", Fn("on_key"), "o")
-        .on_key_value("?", Fn("on_key"), "?")
-        .on_key_value("q", Fn("on_key"), "q")
-        .on_key_value("s", Fn("on_key"), "s")
-        .on_key_value("a", Fn("on_key"), "a")
-        .on_key_value("b", Fn("on_key"), "b")
-        .on_key_value("c", Fn("on_key"), "c")
-        .on_key_value("e", Fn("on_key"), "e")
-        .on_key_value("f", Fn("on_key"), "f")
-        .on_key_value("g", Fn("on_key"), "g")
-        .on_key_value("k", Fn("on_key"), "k")
-        .on_key_value("m", Fn("on_key"), "m")
-        .on_key_value("n", Fn("on_key"), "n")
-        .on_key_value("v", Fn("on_key"), "v")
-        .on_key_value("w", Fn("on_key"), "w")
-        .on_key_value("x", Fn("on_key"), "x")
-        .on_key_value("y", Fn("on_key"), "y")
-        .on_key_value("z", Fn("on_key"), "z")
-        .on_key_value("1", Fn("on_key"), "1")
-        .on_key_value("2", Fn("on_key"), "2")
-        .on_key_value("3", Fn("on_key"), "3")
-        .on_key_value("4", Fn("on_key"), "4")
-        .on_key_value("5", Fn("on_key"), "5")
-        .on_key_value("6", Fn("on_key"), "6")
-        .on_key_value("7", Fn("on_key"), "7")
-        .on_key_value("8", Fn("on_key"), "8")
-        .on_key_value("9", Fn("on_key"), "9")
-        .on_key_value(".", Fn("on_key"), ".")
-        .on_key_value("_", Fn("on_key"), "_")
-        .on_key_value("space", Fn("on_key"), " ")
+    // Every key the mosaic answers, in one loop: a 60-step method chain
+    // exceeds Rhai's expression depth.
+    let keys = [
+        "enter", "left", "right", "up", "down",
+        "h", "j", "k", "l", "tab", "backspace", "u", "escape",
+        "[", "]", "-", "=", "+", "0",
+        "t", "r", "i", "d", "p", "o", "?", "q", "s", "e",
+        "a", "b", "c", "f", "g", "m", "n", "v", "w", "x", "y", "z",
+        "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        ".", "_",
+    ];
+    for key in keys {
+        node = node.on_key_value(key, Fn("on_key"), key);
+    }
+    node.on_key_value("space", Fn("on_key"), " ")
 }
 
 fn logo() {
@@ -1489,79 +2154,221 @@ fn logo() {
     .with_style(style().flex_row())
 }
 
-/// The header: logo and history buttons, breadcrumbs, and the scan controls
-/// (mode segmented, hidden/apparent checkboxes, depth stepper).
-fn header(metric, apparent, no_hidden, depth, mode, layout) {
+/// The header, two rows like tobi's: the logo, the trail and the view
+/// controls on the edge they own; then the scan totals, the find field when
+/// one is typed, and the legend — the key to what the colours say.
+fn header(ctx, metric, apparent, no_hidden, depth, mode, layout, find_open, find, light, scan, viewport) {
+    // Three permanent rows: the bar (logo, breadcrumbs, theme Select),
+    // the controls toolbar (always its own row, wraps freely), and the
+    // info row (totals, find field, legend).
+    let control_items = view_controls(metric, apparent, no_hidden, depth, mode, layout);
+    let controls_row = toolbar::Toolbar(#{
+        label: "View controls",
+        context: control_items,
+    })
+    .with_style(
+        style()
+            .width(relative(1.0))
+            .padding_x(theme_length("metrics.inset"))
+            .padding_y(theme_spacing("sm"))
+    );
     column([
-        row([logo(), breadcrumbs(layout)])
+        title_bar::TitleBar(#{
+            label: "disktree-rhai",
+            title: breadcrumbs(ctx, layout),
+            start: [logo()],
+            end: [theme_select(ctx)],
+            inset_start: 72,
+            window_drag: true,
+        }),
+        controls_row,
+        row([info_row(scan, layout, find_open, find, mode, light)])
             .with_style(
                 style()
                     .flex_row()
-                    .items_center()
                     .width(relative(1.0))
-                    .gap(px(10.0))
+                    .padding_x(theme_length("metrics.inset"))
+                    .padding_y(theme_spacing("sm"))
+                    .border_bottom(px(1.0))
+                    .border_color(theme_color("border"))
             ),
-        row([
-            mode_segmented(mode),
-            checkbox("hidden", !no_hidden, Fn("toggle_hidden")),
-            checkbox("apparent", apparent, Fn("toggle_apparent")),
-            depth_stepper(depth),
-        ])
+    ])
+    .with_style(style().flex_col().width(relative(1.0)))
+}
+
+/// The row under the controls: what the whole scan found as one quiet line,
+/// the filter, and the colour key, clipped from the trailing end when the
+/// row runs out of room.
+fn info_row(scan, layout, find_open, find, mode, light) {
+    let nodes = [scan_totals(scan)];
+    if find_open || layout.filter != "" {
+        nodes.push(find_field(find_open, find, layout));
+    }
+    nodes.push(box([]).with_style(style().flex_grow().min_width(px(0.0))));
+    nodes.push(legend(mode, light));
+    row(nodes)
         .with_style(
             style()
                 .flex_row()
                 .items_center()
-                .gap(px(14.0))
+                .gap(theme_length("space.related"))
                 .width(relative(1.0))
-            ),
-    ])
-    .with_style(
+                .overflow_hidden()
+        )
+}
+
+/// What the whole scan found, as one quiet line; unreadable paths are
+/// flagged in the warning colour when there are any.
+fn scan_totals(scan) {
+    let nodes = [
+        text(core::human_bytes(scan.bytes)).with_style(
+            style()
+                .typography("caption")
+                .text_color(theme_color("text_primary"))
+                .flex_shrink(false)
+        ),
+        text(`· ${core::human_count(scan.files)} files · ${core::human_count(scan.dirs)} dirs`).with_style(
+            style()
+                .typography("caption")
+                .text_color(theme_color("text_muted"))
+                .flex_shrink(false)
+        ),
+    ];
+    if scan.errors > 0 {
+        nodes.push(
+            text(`· ${core::human_count(scan.errors)} unreadable`).with_style(
+                style()
+                    .typography("caption")
+                    .text_color(theme_color("warning"))
+                    .flex_shrink(false)
+            )
+        );
+    }
+    row(nodes)
+        .with_style(style().flex_row().items_center().gap(theme_spacing("xs")).flex_shrink(false))
+}
+
+/// The key to the colours: the categories, or the age ramp in age mode,
+/// with the reclaimable hatch first.
+fn legend(mode, light) {
+    let items = [legend_item(hatch_swatch(light), "Reclaimable")];
+    if mode == 2 {
+        let buckets = [
+            [3, "This week"],
+            [20, "This month"],
+            [100, "Six months"],
+            [300, "This year"],
+            [400, "Older"],
+        ];
+        for bucket in buckets {
+            items.push(
+                legend_item(color_swatch(core::age_fill_mode(bucket[0], light, false)), bucket[1])
+            );
+        }
+    } else {
+        let categories = [
+            ["code", "Code"],
+            ["agent", "Agent scratch"],
+            ["toolchain", "Toolchain"],
+            ["synced", "Synced"],
+            ["git", "Git"],
+            ["media", "Media"],
+            ["documents", "Documents"],
+            ["cache", "Cache"],
+        ];
+        for pair in categories {
+            items.push(legend_item(color_swatch(core::category_accent(pair[0])), pair[1]));
+        }
+    }
+    row(items)
+        .with_style(
+            style()
+                .flex_row()
+                .items_center()
+                .gap(theme_length("space.related"))
+                .overflow_hidden()
+        )
+}
+
+fn legend_item(swatch, label) {
+    row([swatch, text(label).with_style(
         style()
-            .flex_col()
-            .gap(px(8.0))
-            .padding_x(px(16.0))
-            .padding_y(px(10.0))
-            .border_bottom(px(1.0))
-            .border_color(theme_color("border"))
+            .typography("caption")
+            .text_color(theme_color("text_muted"))
+    )])
+    .with_style(style().flex_row().items_center().gap(theme_spacing("xs")).flex_shrink(false))
+}
+
+fn color_swatch(color) {
+    box([]).with_style(
+        style()
+            .width(px(10.0))
+            .height(px(10.0))
+            .background(rgba(color))
+            .flex_shrink(false)
     )
 }
 
-fn history_button(label, enabled, handler) {
-    if enabled {
-        return w::Button(#{ label: label, variant: "ghost", on_click: handler });
-    }
-    box([text(label).with_style(
+/// The hatch swatch that stands for reclaimable space: the neutral ground
+/// with three 1px slashes, like the tiles it keys.
+fn hatch_swatch(light) {
+    let ground = core::category_fill_mode("other", 0, light, false);
+    box([
+        canvas(canvas_scene([
+            canvas_stroke_path(
+                "legend-hatch",
+                [
+                    path_move(0.0, 10.0),
+                    path_line(10.0, 0.0),
+                    path_move(0.0, 4.0),
+                    path_line(4.0, 0.0),
+                    path_move(6.0, 10.0),
+                    path_line(10.0, 6.0),
+                ],
+                1.0,
+                rgba(core::hatch_color())
+            ),
+        ]))
+        .with_style(style().width(px(10.0)).height(px(10.0))),
+    ])
+    .with_style(
         style()
-            .font_size(px(11.0))
-            .text_color(theme_color("text_muted"))
-            .padding_x(px(8.0))
-            .padding_y(px(4.0))
-    )])
-    .with_style(style().opacity(0.4))
+            .width(px(10.0))
+            .height(px(10.0))
+            .background(rgba(ground))
+            .overflow_hidden()
+            .flex_shrink(false)
+    )
 }
 
-/// The breadcrumb bar: history buttons, the root path, then the crumb path.
-/// Each crumb jumps straight to its directory.
-fn breadcrumbs(layout) {
-    let nodes = [
-        history_button("<", layout.valid && layout.back.len() > 0, Fn("back_clicked")),
-        history_button(">", layout.valid && layout.forward.len() > 0, Fn("forward_clicked")),
-    ];
+/// The breadcrumb bar: the root path, then the crumb path. Each crumb jumps
+/// straight to its directory; the history `<` `>` live beside the metric
+/// switch in the controls, like tobi's.
+fn breadcrumbs(ctx, layout) {
+    let nodes = [];
     let parts = split_path(layout.root);
+    let part_index = 0;
     for part in parts {
-        nodes.push(
-            text(part).with_style(
-                style()
-                    .font_size(px(12.0))
-                    .text_color(theme_color("text_muted"))
-                    .whitespace_nowrap().text_ellipsis()
-            )
-        );
+        let is_root = part_index == parts.len() - 1;
+        if is_root {
+            // The scan root: clicking it resets to the root view.
+            nodes.push(crumb_segment(part, layout.crumbs.len() == 0, -1));
+        } else {
+            nodes.push(
+                text(part).with_style(
+                    style()
+                        .font_size(px(12.0))
+                        .text_color(theme_color("text_muted"))
+                        .whitespace_nowrap().text_ellipsis()
+                )
+            );
+        }
         nodes.push(
             text("/").with_style(
-                style().font_size(px(12.0)).text_color(theme_color("border"))
+                style().typography("body_small").text_color(theme_color("border"))
             )
         );
+        part_index += 1;
     }
     let i = 0;
     while i < layout.names.len() {
@@ -1571,6 +2378,11 @@ fn breadcrumbs(layout) {
             label = "?";
         }
         nodes.push(crumb_segment(label, active, i));
+        // Every crumb but the scanned root lists its siblings: largest
+        // first, share bar and size in each row, arrows and Enter work.
+        if i >= 1 {
+            nodes.push(crumb_menu_toggle(ctx, i));
+        }
         if !active {
             nodes.push(
                 text("/").with_style(
@@ -1585,7 +2397,7 @@ fn breadcrumbs(layout) {
             style()
                 .flex_row()
                 .items_center()
-                .gap(px(2.0))
+                .gap(theme_spacing("xxs"))
                 .flex_grow()
                 .overflow_hidden()
         )
@@ -1598,19 +2410,21 @@ fn crumb_segment(label, active, index) {
     }
     box([text(label).with_style(
         style()
-            .font_size(px(12.0))
+            .typography("body_small")
             .font_weight(weight)
             .text_color(theme_color("text_primary"))
             .whitespace_nowrap().text_ellipsis()
             .max_width(px(180.0))
     )])
     .on_click_value(Fn("crumb_clicked"), index)
+    .accessibility_role("button")
+    .accessibility_label(`Go to ${label}`)
     .with_style(
         style()
-            .padding_x(px(6.0))
-            .padding_y(px(2.0))
+            .padding_x(theme_spacing("sm"))
+            .padding_y(theme_spacing("xxs"))
             .flex_shrink(false)
-            .hover(style().background(theme_color("surface_raised")))
+            .hover(style().background(theme_color("surface_hover")))
     )
 }
 
@@ -1654,123 +2468,116 @@ fn split_path(path) {
     parts
 }
 
-fn checkbox(label, checked, handler) {
-    let mark = " ";
-    if checked {
-        mark = "×";
+/// The view controls: what areas measure (segmented toggle), history `<`
+/// `>` beside it, what is visible (checkboxes), how deep the mosaic draws
+/// (stepper). Every control hands focus back to the mosaic when used — the
+/// keyboard belongs to the tiles unless a control is being reached for.
+fn view_controls(metric, apparent, no_hidden, depth, mode, layout) {
+    let mode_items = [
+        #{ value: "size", label: "Size" },
+        #{ value: "files", label: "Files" },
+        #{ value: "age", label: "Age" },
+    ];
+    let depth_items = [];
+    let level = 1;
+    while level <= 6 {
+        depth_items.push(#{ value: `${level}`, label: `${level}` });
+        level += 1;
     }
-    let mark_color = theme_color("text_muted");
-    if checked {
-        mark_color = theme_color("accent");
-    }
-    row([
-        box([text(mark).with_style(
-            style()
-                .font_size(px(10.0))
-                .text_color(mark_color)
-        )])
-        .with_style(
-            style()
-                .width(px(14.0))
-                .height(px(14.0))
-                .items_center()
-                .justify_center()
-                .flex_shrink(false)
-                .border(px(1.0))
-                .border_color(theme_color("border"))
-        ),
-        text(label).with_style(
-            style().font_size(px(11.0)).text_color(theme_color("text_muted"))
-        ),
-    ])
-    .on_click(handler)
-    .with_style(
-        style()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .flex_shrink(false)
-    )
+    [
+        toggle_group::ToggleGroup(#{
+            key: "mode",
+            label: "Metric mode",
+            items: mode_items,
+            values: [mode_value(mode)],
+            allow_empty: false,
+            on_change: Fn("mode_changed"),
+        }),
+        button::Button(#{
+            text: "<",
+            variant: "ghost",
+            disabled: !(layout.valid && layout.back.len() > 0),
+            on_click: Fn("back_clicked"),
+        }),
+        button::Button(#{
+            text: ">",
+            variant: "ghost",
+            disabled: !(layout.valid && layout.forward.len() > 0),
+            on_click: Fn("forward_clicked"),
+        }),
+        checkbox::Checkbox(#{
+            checked: !no_hidden,
+            label: "hidden files",
+            on_change: Fn("hidden_changed"),
+        }),
+        checkbox::Checkbox(#{
+            checked: apparent,
+            label: "apparent size",
+            on_change: Fn("apparent_changed"),
+        }),
+        toggle_group::ToggleGroup(#{
+            key: "depth",
+            label: "Depth",
+            items: depth_items,
+            values: [`${depth}`],
+            allow_empty: false,
+            on_change: Fn("depth_changed"),
+        }),
+    ]
 }
 
-/// Size | Files | Age: what areas measure and what colour says.
-fn mode_segmented(mode) {
-    row([
-        segment("Size", mode == 0, 0),
-        segment("Files", mode == 1, 1),
-        segment("Age", mode == 2, 2),
-    ])
-    .with_style(
-        style()
-            .flex_row()
-            .items_center()
-            .border(px(1.0))
-            .border_color(theme_color("border"))
-            .flex_shrink(false)
-    )
+fn mode_value(mode) {
+    if mode == 1 {
+        return "files";
+    }
+    if mode == 2 {
+        return "age";
+    }
+    "size"
 }
 
-fn segment(label, active, mode) {
-    let color = theme_color("text_muted");
-    let weight = 400;
-    let background = theme_color("surface");
-    if active {
-        color = theme_color("on_accent");
-        weight = 600;
-        background = theme_color("accent");
+fn mode_index(value) {
+    if value == "files" {
+        return 1;
     }
-    box([text(label).with_style(
-        style()
-            .font_size(px(11.0))
-            .font_weight(weight)
-            .text_color(color)
-    )])
-    .on_click_value(Fn("mode_clicked"), mode)
-    .with_style(
-        style()
-            .padding_x(px(10.0))
-            .padding_y(px(4.0))
-            .background(background)
-    )
+    if value == "age" {
+        return 2;
+    }
+    0
 }
 
-fn depth_stepper(depth) {
-    row([
-        text(`depth ${depth}`).with_style(
-            style().font_size(px(11.0)).text_color(theme_color("text_muted"))
-        ),
-        step_button("−", -1, depth <= 1),
-        step_button("+", 1, depth >= 6),
-    ])
-    .with_style(
-        style()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .padding_x(px(10.0))
-            .padding_y(px(3.0))
-            .border(px(1.0))
-            .border_color(theme_color("border"))
-            .flex_shrink(false)
-    )
+fn mode_changed(ctx, values) {
+    if values.len() > 0 {
+        set_mode(ctx, mode_index(values[0]));
+    }
+    ctx.focus("root");
 }
 
-fn step_button(label, step, disabled) {
-    let color = theme_color("text_muted");
-    if disabled {
-        color = theme_color("border");
+fn hidden_changed(ctx, payload) {
+    ctx.set_state("no_hidden", !payload.checked);
+    ctx.focus("root");
+}
+
+fn apparent_changed(ctx, payload) {
+    ctx.set_state("apparent", payload.checked);
+    ctx.focus("root");
+}
+
+fn depth_changed(ctx, values) {
+    if values.len() > 0 {
+        // ToggleGroup values are strings, and the engine registers no string
+        // number parsing — match against the segment values instead.
+        let wanted = values[0];
+        let level = 1;
+        while level <= 6 {
+            if `${level}` == wanted {
+                ctx.set_state("depth", level);
+                break;
+            }
+            level += 1;
+        }
     }
-    let node = box([text(label).with_style(
-        style()
-            .font_size(px(11.0))
-            .text_color(color)
-            .width(px(16.0))
-            .flex_shrink(false)
-    )]);
-    if disabled {
-        return node;
-    }
-    node.on_click_value(Fn("depth_clicked"), step)
+    ctx.focus("root");
 }
 
 /// tobi's progress estimate: a slow curve that never quite reaches 1.
@@ -1793,23 +2600,29 @@ fn scan_panel(scan) {
     } else {
         `Read ${scan.root}`
     };
-    let spinner = if reading { "◐" } else { "·" };
-    let stats = row([
-        w::stat_cell("files", core::human_count(scan.files), false),
-        w::stat_cell("directories", core::human_count(scan.dirs), false),
-        w::stat_cell("measured", core::human_bytes(scan.bytes), false),
-        w::stat_cell("unreadable", core::human_count(scan.errors), scan.errors > 0),
+    let status_row = row([
+        if reading {
+            spinner::Spinner(#{ key: "scan-spinner", label: "Reading" })
+        } else {
+            box([])
+        },
+        text(status).with_style(
+            style()
+                .typography("subtitle")
+                .text_color(theme_color("text_primary"))
+        ),
     ])
-    .with_style(
-        style()
-            .flex_row()
-            .gap(px(10.0))
-            .width(relative(1.0))
-    );
+    .with_style(style().flex_row().items_center().gap(px(10.0)).padding_bottom(px(14.0)));
+    let figures = stat::stats([
+        #{ label: "files", value: core::human_count(scan.files) },
+        #{ label: "directories", value: core::human_count(scan.dirs) },
+        #{ label: "measured", value: core::human_bytes(scan.bytes) },
+        #{ label: "unreadable", value: core::human_count(scan.errors) },
+    ]);
     let action = if reading {
-        w::Button(#{ label: "Cancel", variant: "outline", on_click: Fn("scan_cancel") })
+        button::Button(#{ text: "Cancel", variant: "outline", on_click: Fn("scan_cancel") })
     } else {
-        w::Button(#{ label: "Scan again", variant: "outline", on_click: Fn("scan_again") })
+        button::Button(#{ text: "Scan again", variant: "primary", on_click: Fn("scan_again") })
     };
     let note = if scan.phase == "cancelled" {
         "Nothing is shown from a scan that did not finish. Scan again to retry."
@@ -1820,21 +2633,22 @@ fn scan_panel(scan) {
     };
 
     column([
-        row([
-            text(`${spinner}  ${status}`).with_style(
-                style()
-                    .font_size(px(15.0))
-                    .font_weight(600)
-                    .text_color(theme_color("text_primary"))
-            ),
-        ])
-        .with_style(style().flex_row().padding_bottom(px(14.0))),
-        stats,
-        box([w::progress_track(progress_estimate(scan.bytes))])
-            .with_style(style().padding_y(px(14.0))),
+        status_row,
+        figures,
+        box([progress::Progress(#{
+            key: "scan-progress",
+            label: "Scan progress",
+            value: progress_estimate(scan.bytes) * 100.0,
+            max: 100.0,
+            width: 504,
+        })])
+        .with_style(style().padding_y(px(14.0))),
         row([
             text(note).with_style(
-                style().font_size(px(11.0)).text_color(theme_color("text_muted")).flex_grow()
+                style()
+                    .typography("caption")
+                    .text_color(theme_color("text_muted"))
+                    .flex_grow()
             ),
             action,
         ])
@@ -1859,51 +2673,63 @@ fn clamp_min(v) {
 }
 
 /// The find field: a three-key input (type, backspace, enter) with a live
-/// match count; once applied it states what the mosaic is filtered by.
-fn find_bar(open, find, layout) {
+/// match count as a Badge; once applied it states what the mosaic is
+/// filtered by. An inline bordered chip on the totals row, the border in
+/// the accent while it owns the keyboard.
+fn find_field(open, find, layout) {
     let left = "";
-    let right = "";
     if open {
         let needle = find;
         if needle == "" {
             needle = "type to filter";
         }
         left = `find: ${needle}`;
-        right = "enter apply · esc close";
     } else {
         left = `filter: ${layout.filter}`;
     }
+    let tail = [];
     if layout.find_summary != () {
         let summary = layout.find_summary;
-        right = `${core::human_count(summary.count)} matches · ${core::human_bytes(summary.bytes)} · esc clears`;
+        tail.push(badge::Badge(#{
+            text: `${core::human_count(summary.count)} matches`,
+            variant: "accent",
+            dot: false,
+        }));
+        tail.push(
+            text(`${core::human_bytes(summary.bytes)} · esc clears`).with_style(
+                style().typography("caption").text_color(theme_color("text_muted"))
+            )
+        );
+    } else if open {
+        tail.push(
+            text("enter apply · esc close").with_style(
+                style().typography("caption").text_color(theme_color("text_muted"))
+            )
+        );
     }
-    row([
-        text(left).with_style(
-            style()
-                .font_size(px(12.0))
-                .font_weight(600)
-                .text_color(theme_color("text_primary"))
-                .flex_grow()
-        ),
-        text(right).with_style(
-            style().font_size(px(11.0)).text_color(theme_color("text_muted"))
-        ),
-    ])
+    row([text(left).with_style(
+        style()
+            .typography("body_small")
+            .font_weight(600)
+            .text_color(theme_color("text_primary"))
+    )] + tail)
     .with_key("find_bar")
     .with_style(
         style()
             .flex_row()
             .items_center()
-            .padding_x(px(16.0))
-            .padding_y(px(6.0))
-            .border_bottom(px(1.0))
-            .border_color(theme_color("border"))
+            .gap(theme_length("space.related"))
+            .padding_x(theme_spacing("sm"))
+            .padding_y(theme_spacing("xxs"))
+            .border(px(1.0))
+            .border_color(if open { theme_color("accent") } else { theme_color("border") })
+            .flex_shrink(false)
     )
 }
 
 /// The main stage: the scan panel while scanning, the mosaic when a layout
 /// is cached. The help overlay floats above both.
-fn stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light) {
+fn stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light, paint) {
     let content = ();
     if !layout.valid {
         content = box([scan_panel(scan)])
@@ -1918,18 +2744,20 @@ fn stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light) {
             );
     } else {
         content = box(
-            mosaic_nodes(layout, cursor, metric, scan, mode)
+            mosaic_nodes(layout, cursor, metric, scan, paint)
         )
             .with_key("mosaic")
             .with_ref(viewport_ref)
+            .accessibility_role("image")
+            .accessibility_label(`Disk usage treemap of ${layout.root}`)
             .with_style(
                 style()
                     .flex_grow()
                     .width(relative(1.0))
                     .relative()
                     .overflow_hidden()
-                    .margin_x(px(4.0))
-                    .margin_y(px(4.0))
+                    .margin_x(theme_spacing("xxs"))
+                    .margin_y(theme_spacing("xxs"))
             )
             .on("wheel", Fn("on_wheel"));
     }
@@ -1943,11 +2771,11 @@ fn stage(scan, layout, cursor, metric, mode, viewport_ref, help_open, light) {
 /// The mosaic as three layers: the cached base canvas (fills, strips,
 /// hatch — identical nodes across hover crossings, so the retained renderer
 /// keeps it untouched), a tiny ring canvas rebuilt per crossing, and the
-/// cached labels. Pointer events ride the base canvas.
-fn mosaic_nodes(layout, cursor, metric, scan, mode) {
-    let paint = layout.paint_by_mode[`${mode}`];
+/// cached labels. Pointer events ride the base canvas. The paint for the
+/// active mode arrives from its own store value (see reset_derived_layout).
+fn mosaic_nodes(layout, cursor, metric, scan, paint) {
     if paint == () {
-        paint = #{ base: [], labels: [] };
+        paint = #{ base: [], labels: [], out_keys: #{} };
     }
     let base = canvas(canvas_scene(paint_commands(paint.base, layout.view)))
         .with_key("mosaic_canvas")
@@ -1960,7 +2788,9 @@ fn mosaic_nodes(layout, cursor, metric, scan, mode) {
                 .height(px(layout.height))
         )
         .on("pointer_move", Fn("on_pointer_move"))
-        .on("pointer_down", Fn("on_pointer_down"));
+        .on("pointer_down", Fn("on_pointer_down"))
+        .on("pointer_move", Fn("panel_drag_move"))
+        .on("pointer_up", Fn("panel_drag_end"));
     let rings = canvas(canvas_scene(ring_commands(layout, cursor)))
         .with_key("mosaic_rings")
         .with_style(
@@ -1972,7 +2802,7 @@ fn mosaic_nodes(layout, cursor, metric, scan, mode) {
                 .height(px(layout.height))
         );
     [base, rings]
-        + label_nodes(paint.labels, layout, metric)
+        + label_nodes(paint.labels, layout, metric, paint.out_keys)
         + tooltip_nodes(layout, cursor, metric, scan)
 }
 
@@ -2033,24 +2863,29 @@ fn paint_commands(rows, view) {
 /// as plain rows: ["r", key, x, y, w, h, color] / ["l", key, x1, y1, x2,
 /// y2, width, color]. Colors are already resolved ints, so turning a row
 /// back into a command at render is one native call.
-fn tile_base_commands(tile, mode, light, now) {
+fn tile_base_commands(tile, mode, light, now, out_keys) {
     let key = tile_key(tile);
+    let dim = key in out_keys;
     let r = tile.rect;
     let fill = ();
     if tile.kind == "others" {
         // The merged tail has no entry of its own; it wears the neutral tone.
-        fill = core::category_fill_mode("other", tile.depth, light);
+        fill = core::category_fill_mode("other", tile.depth, light, dim);
     } else if mode == 2 {
-        fill = core::age_fill_mode(core::age_days(tile.entry.modified, now), light);
+        fill = core::age_fill_mode(core::age_days(tile.entry.modified, now), light, dim);
     } else {
-        fill = core::category_fill_mode(tile.entry.category, tile.depth, light);
+        fill = core::category_fill_mode(tile.entry.category, tile.depth, light, dim);
     }
     let rows = [
         #{ t: "r", k: `f:${key}`, x: r.x, y: r.y, w: r.w, h: r.h, c: fill },
     ];
-    // Top-level directories wear a 2px strip in their category accent.
+    // Top-level directories wear a 2px strip in their category accent; a
+    // filtered-out tile's strip steps back with its fill.
     if tile.depth == 0 && tile.kind == "dir" {
         let accent = core::category_accent(tile.entry.category);
+        if dim {
+            accent = core::dimmed_color(accent, light);
+        }
         rows.push(#{ t: "r", k: `s:${key}`, x: r.x, y: r.y, w: r.w, h: 2.0, c: accent });
     }
     // Reclaimable space is hatched with 1px slashes 6px apart — ONE stroke
@@ -2058,7 +2893,7 @@ fn tile_base_commands(tile, mode, light, now) {
     // cumulative array-size limit makes storing slash coordinates a budget
     // hazard at deep layouts; generating them at render is a few dozen
     // loop steps.
-    if tile.entry != () && tile.entry.reclaim != () {
+    if tile.entry != () && tile.entry.reclaim != () && !dim {
         rows.push(#{ t: "p", k: `h:${key}`, r: r, w: 1.0, c: core::hatch_color() });
     }
     rows
@@ -2151,7 +2986,7 @@ fn sorted_label_candidates(tiles) {
 }
 /// The label nodes for one render: screen-space threshold over the cached,
 /// area-sorted candidates, at most 150.
-fn label_nodes(indices, layout, metric) {
+fn label_nodes(indices, layout, metric, out_keys) {
     let labels = [];
     let count = 0;
     for index in indices {
@@ -2163,7 +2998,7 @@ fn label_nodes(indices, layout, metric) {
         if r.w < 54.0 || r.h < 15.0 {
             continue;
         }
-        let label = tile_label(tile, metric, layout.view);
+        let label = tile_label(tile, metric, layout.view, tile_key(tile) in out_keys);
         if label != () {
             labels.push(label);
             count += 1;
@@ -2172,9 +3007,15 @@ fn label_nodes(indices, layout, metric) {
     labels
 }
 
-fn tile_label(tile, metric, view) {
+fn tile_label(tile, metric, view, dim) {
     let key = tile_key(tile);
     let r = core::view_project(view, tile.rect);
+    let label_color = theme_color("text_primary");
+    let value_color = theme_color("text_muted");
+    if dim {
+        label_color = theme_color("disabled");
+        value_color = theme_color("disabled");
+    }
     if tile.kind == "others" {
         return text(`+${tile.others} more`)
             .with_key(`l:${key}`)
@@ -2204,7 +3045,7 @@ fn tile_label(tile, metric, view) {
                 style()
                     .font_size(px(12.0))
                     .font_weight(700)
-                    .text_color(theme_color("text_primary"))
+                    .text_color(label_color)
                     .overflow_hidden()
                     .whitespace_nowrap().text_ellipsis()
                     .flex_grow()
@@ -2212,7 +3053,7 @@ fn tile_label(tile, metric, view) {
             text(value).with_style(
                 style()
                     .font_size(px(11.0))
-                    .text_color(theme_color("text_muted"))
+                    .text_color(value_color)
                     .whitespace_nowrap().text_ellipsis()
             ),
         ])
@@ -2237,7 +3078,7 @@ fn tile_label(tile, metric, view) {
         text(name).with_style(
             style()
                 .font_size(px(11.0))
-                .text_color(theme_color("text_primary"))
+                .text_color(label_color)
                 .overflow_hidden()
                 .whitespace_nowrap().text_ellipsis()
         ),
@@ -2247,7 +3088,7 @@ fn tile_label(tile, metric, view) {
             text(value).with_style(
                 style()
                     .font_size(px(11.0))
-                    .text_color(theme_color("text_muted"))
+                    .text_color(value_color)
                     .overflow_hidden()
                     .whitespace_nowrap().text_ellipsis()
             )
@@ -2340,7 +3181,7 @@ fn tooltip_nodes(layout, cursor, metric, scan) {
                     .width(px(216.0))
             ),
             text(`${value} · ${kind} · ${ago_label(tile.entry.modified, scan.now)}`).with_style(
-                style().font_size(px(11.0)).text_color(theme_color("text_muted"))
+                style().typography("caption").text_color(theme_color("text_muted"))
             ),
         ])
             .with_key("tooltip")
@@ -2381,43 +3222,31 @@ fn ago_label(modified, now) {
 
 // -- sidebar --------------------------------------------------------------------
 
-/// Selection / Worth a look / Disk — gpuix's right panel, in theme tokens.
-fn sidebar(scan, layout, cursor, mode) {
-    let selection = selection_panel(scan, layout, cursor);
-    let worth = worth_panel(scan, layout);
-    let disk = disk_panel(scan);
-    column([selection, divider(), worth, divider(), disk])
-        .with_key("sidebar")
-        .with_style(
-            style()
-                .flex_col()
-                .width(px(264.0))
-                .flex_shrink(false)
-                .padding_x(px(14.0))
-                .padding_y(px(10.0))
-                .gap(px(12.0))
-                .border_left(px(1.0))
-                .border_color(theme_color("border"))
-                .overflow_hidden()
-        )
-}
-
-fn divider() {
-    box([]).with_style(
+/// Selection / Worth a look / Disk — the right panel. Section headers, the
+/// big figures and the bars are 0.2 patterns (Section, Stat, Progress); the
+/// finding rows stay bespoke, they are the skin's own visualization.
+fn sidebar(scan, layout, cursor, mode, git, width) {
+    column([
+        selection_panel(scan, layout, cursor, git),
+        divider::Divider(#{ orientation: "horizontal" }),
+        worth_panel(scan, layout),
+        divider::Divider(#{ orientation: "horizontal" }),
+        disk_panel(scan),
+    ])
+    .with_key("sidebar")
+    .with_style(
         style()
-            .width(relative(1.0))
-            .height(px(1.0))
-            .background(theme_color("border"))
+            .flex_col()
+            .width(px(width))
             .flex_shrink(false)
-    )
-}
-
-fn eyebrow(label) {
-    text(label).with_style(
-        style()
-            .font_size(px(10.0))
-            .font_weight(700)
-            .text_color(theme_color("text_muted"))
+            .min_width(px(0.0))
+            .overflow_hidden()
+            .padding_x(theme_length("metrics.inset"))
+            .padding_y(theme_length("space.related"))
+            .gap(theme_length("space.group"))
+            .border_left(px(1.0))
+            .border_color(theme_color("border"))
+            .overflow_hidden()
     )
 }
 
@@ -2444,8 +3273,10 @@ fn share_bar(fraction, color) {
     )
 }
 
-/// What is selected — or hovered, or on screen — with its figures.
-fn selection_panel(scan, layout, cursor) {
+/// What is selected — or hovered, or on screen — with its figures: a Stat
+/// for the size, a Progress for the share of the scan, a DescriptionList
+/// for the facts and official Buttons for the actions.
+fn selection_panel(scan, layout, cursor, git) {
     let crumbs = layout.crumbs;
     if cursor.selected != () && core::crumb_starts_with(cursor.selected, layout.crumbs) {
         crumbs = cursor.selected;
@@ -2481,11 +3312,14 @@ fn selection_panel(scan, layout, cursor) {
     let below_root = crumbs.len() > layout.crumbs.len();
     let actions = [];
     if is_dir && below_root {
-        actions.push(pill_button("Open", true, crumbs));
+        actions.push(
+            button::Button(#{ text: "Open", variant: "primary", on_click: Fn("open_clicked").curry(crumbs) })
+        );
     }
-    actions.push(pill_button("Reveal", false, crumbs));
-    column([
-        eyebrow("Selection"),
+    actions.push(
+        button::Button(#{ text: "Reveal", variant: "secondary", on_click: Fn("reveal_clicked").curry(crumbs) })
+    );
+    section::Section(#{ title: "Selection", voice: "label", content: column([
         row([
             box([]).with_style(
                 style()
@@ -2496,8 +3330,7 @@ fn selection_panel(scan, layout, cursor) {
             ),
             text(name).with_style(
                 style()
-                    .font_size(px(14.0))
-                    .font_weight(600)
+                    .typography("subtitle")
                     .text_color(theme_color("text_primary"))
                     .overflow_hidden()
                     .whitespace_nowrap().text_ellipsis()
@@ -2507,43 +3340,48 @@ fn selection_panel(scan, layout, cursor) {
         .with_style(style().flex_row().items_center().gap(px(8.0)).width(relative(1.0))),
         text(path).with_style(
             style()
-                .font_size(px(10.0))
+                .typography("caption")
                 .text_color(theme_color("text_muted"))
                 .overflow_hidden()
                 .whitespace_nowrap().text_ellipsis()
                 .width(relative(1.0))
         ),
-        row([
-            text(size_value).with_style(
-                style()
-                    .font_size(px(26.0))
-                    .font_weight(300)
-                    .text_color(theme_color("text_primary"))
-            ),
-            text(size_unit).with_style(
-                style()
-                    .font_size(px(12.0))
-                    .text_color(theme_color("text_muted"))
-                    .self_end()
-                    .padding_left(px(4.0))
-            ),
-        ])
-        .with_style(style().flex_row().items_end().padding_y(px(6.0))),
-        share_bar(share, theme_color("accent")),
-        row([
-            figure("Of scan", `${(share * 100.0).to_int()}%`),
-            figure("Files", core::human_count(files)),
-        ])
-        .with_style(style().flex_row().gap(px(16.0)).padding_y(px(8.0))),
-        row([
-            figure("Last write", ago_label(modified, scan.now)),
-            figure("Kind", kind),
-        ])
-        .with_style(style().flex_row().gap(px(16.0))),
+        stat::Stat(#{ label: "size", value: size_value, unit: size_unit }),
+        box([progress::Progress(#{
+            key: "selection-share",
+            label: "Share of scan",
+            value: share * 100.0,
+            max: 100.0,
+            width: 236,
+        })]),
+        description_list::DescriptionList(#{
+            label: "Selection facts",
+            label_width: px(78.0),
+            items: [
+                #{ label: "of scan", value: `${(share * 100.0).to_int()}%`, numeric: true },
+                #{ label: "files", value: core::human_count(files), numeric: true },
+                #{ label: "last write", value: ago_label(modified, scan.now) },
+                #{ label: "kind", value: kind },
+            ] + git_rows(git, crumbs),
+        }),
         row(actions)
         .with_style(style().flex_row().gap(px(8.0)).padding_y(px(4.0))),
     ])
-    .with_style(style().flex_col().gap(px(6.0)).width(relative(1.0)))
+    .with_style(style().flex_col().gap(px(6.0)).width(relative(1.0))) })
+}
+
+/// The git figures for the selection, when it is a checkout git was asked
+/// about: one row of summary, or nothing.
+fn git_rows(git, crumbs) {
+    let rows = [];
+    let key = crumb_key(crumbs);
+    if key in git {
+        let state = git[key];
+        if state != "pending" && state != () {
+            rows.push(#{ label: "git", value: state.summary });
+        }
+    }
+    rows
 }
 
 /// ["4.2", "GiB"] from "4.2 GiB".
@@ -2553,38 +3391,6 @@ fn split_first_word(text_value) {
         return [text_value, ""];
     }
     [text_value.sub_string(0, cut), text_value.sub_string(cut + 1)]
-}
-
-/// A small Open/Reveal pill carrying the crumbs it acts on.
-fn pill_button(label, primary, crumbs) {
-    let background = theme_color("surface");
-    let color = theme_color("text_primary");
-    let border_color = theme_color("border");
-    if primary {
-        background = theme_color("accent");
-        color = theme_color("on_accent");
-        border_color = theme_color("accent");
-    }
-    let handler = Fn("reveal_clicked");
-    if primary {
-        handler = Fn("open_clicked");
-    }
-    box([text(label).with_style(
-        style()
-            .font_size(px(11.0))
-            .font_weight(600)
-            .text_color(color)
-            .padding_x(px(10.0))
-            .padding_y(px(4.0))
-    )])
-    .on_click_value(handler, crumbs)
-    .with_style(
-        style()
-            .background(background)
-            .border(px(1.0))
-            .border_color(border_color)
-            .flex_shrink(false)
-    )
 }
 
 /// The selection's path, from the cached crumb names: root + the crumb
@@ -2606,18 +3412,6 @@ fn selection_path(layout, crumbs, name) {
     built
 }
 
-fn figure(label, value) {
-    column([
-        text(label).with_style(
-            style().font_size(px(10.0)).text_color(theme_color("text_muted"))
-        ),
-        text(value).with_style(
-            style().font_size(px(12.0)).text_color(theme_color("text_primary"))
-        ),
-    ])
-    .with_style(style().flex_col().gap(px(2.0)))
-}
-
 /// The entry a crumb path points at, from the cached layout tiles first
 /// (no capability call), falling back to `()`.
 fn node_entry_static(crumbs, layout) {
@@ -2635,92 +3429,115 @@ fn root_name(layout) {
     layout.root
 }
 
-/// Worth a look: the scanner's findings, clickable to select.
+/// Worth a look: the scanner's findings, clickable to select. The section
+/// header carries the total as a Badge.
+/// One finding row: the accent bar, label and detail, share bar and size.
+fn insight_row(finding, fraction, layout) {
+    column([insight_row_content(finding, fraction)])
+        .accessibility_role("button")
+        .accessibility_label(`Select ${finding.label}`)
+        .on_click_value(Fn("insight_clicked"), index_of_finding(layout, finding))
+        .with_style(
+            style()
+                .flex_col()
+                .padding_x(theme_spacing("sm"))
+                .padding_y(theme_spacing("xxs"))
+                .width(relative(1.0))
+                .hover(style().background(theme_color("surface_hover")))
+        )
+}
+
+/// The content inside one finding row: bar + text + figures.
+fn insight_row_content(finding, fraction) {
+    row([
+        box([]).with_style(
+            style()
+                .width(px(3.0))
+                .height(px(26.0))
+                .background(theme_color("accent"))
+                .flex_shrink(false)
+        ),
+        insight_row_text(finding),
+        insight_row_figures(finding, fraction),
+    ])
+    .with_style(
+        style()
+            .flex_row()
+            .items_center()
+            .gap(theme_length("space.related"))
+            .width(relative(1.0))
+    )
+}
+
+/// The label and detail of one finding.
+fn insight_row_text(finding) {
+    column([
+        text(finding.label).with_style(insight_text_style(theme_color("text_primary"))),
+        text(finding.detail).with_style(insight_text_style(theme_color("text_muted"))),
+    ])
+    .with_style(style().flex_col().gap(theme_spacing("xxs")).flex_grow())
+}
+
+/// The size and share bar of one finding.
+fn insight_row_figures(finding, fraction) {
+    column([
+        text(core::human_bytes_short(finding.bytes)).with_style(
+            style()
+                .typography("caption")
+                .text_color(theme_color("text_primary"))
+        ),
+        share_bar(fraction, theme_color("accent")),
+    ])
+    .with_style(style().flex_col().gap(theme_spacing("xxs")).items_end().flex_shrink(false))
+}
+
+fn insight_text_style(color) {
+    style()
+        .typography("caption")
+        .text_color(color)
+        .overflow_hidden()
+        .whitespace_nowrap().text_ellipsis()
+        .width(px(130.0))
+}
+
 fn worth_panel(scan, layout) {
-    let rows = [];
     let rows_node = [];
     let largest = 1;
-    for finding in layout.insights {
-        if finding.bytes > largest {
-            largest = finding.bytes;
+    for total_finding in layout.insights {
+        if total_finding.bytes > largest {
+            largest = total_finding.bytes;
         }
     }
     for finding in layout.insights {
         let fraction = finding.bytes.to_float() / largest.to_float();
-        rows_node.push(
-            column([
-                row([
-                    box([]).with_style(
-                        style()
-                            .width(px(3.0))
-                            .height(px(26.0))
-                            .background(theme_color("accent"))
-                            .flex_shrink(false)
-                    ),
-                    column([
-                        text(finding.label).with_style(
-                            style()
-                                .font_size(px(11.0))
-                                .text_color(theme_color("text_primary"))
-                                .overflow_hidden()
-                                .whitespace_nowrap().text_ellipsis()
-                                .width(px(130.0))
-                        ),
-                        text(finding.detail).with_style(
-                            style()
-                                .font_size(px(10.0))
-                                .text_color(theme_color("text_muted"))
-                                .overflow_hidden()
-                                .whitespace_nowrap().text_ellipsis()
-                                .width(px(130.0))
-                        ),
-                    ])
-                    .with_style(style().flex_col().gap(px(1.0)).flex_grow()),
-                    column([
-                        text(core::human_bytes_short(finding.bytes)).with_style(
-                            style()
-                                .font_size(px(11.0))
-                                .text_color(theme_color("text_primary"))
-                        ),
-                        share_bar(fraction, theme_color("accent")),
-                    ])
-                    .with_style(style().flex_col().gap(px(4.0)).items_end().flex_shrink(false)),
-                ])
-                .with_style(style().flex_row().items_center().gap(px(8.0)).width(relative(1.0))),
-            ])
-            .on_click_value(Fn("insight_clicked"), index_of_finding(layout, finding))
-            .with_style(
-                style()
-                    .flex_col()
-                    .padding_x(px(6.0))
-                    .padding_y(px(5.0))
-                    .width(relative(1.0))
-                    .hover(style().background(theme_color("surface_raised")))
-            )
-        );
+        rows_node.push(insight_row(finding, fraction, layout));
     }
     let total = 0;
     for finding in layout.insights {
         total += finding.bytes;
     }
-    let header = row([
-        eyebrow("Worth a look"),
-        text(core::human_bytes_short(total)).with_style(
-            style().font_size(px(10.0)).text_color(theme_color("accent"))
-        ),
-    ])
-    .with_style(style().flex_row().justify_between().width(relative(1.0)));
-    if layout.insights.len() == 0 {
-        return column([
-            header,
-            text("Nothing obviously disposable").with_style(
-                style().font_size(px(11.0)).text_color(theme_color("text_muted"))
-            ),
-        ])
-        .with_style(style().flex_col().gap(px(8.0)).width(relative(1.0)));
+    let actions = [];
+    if layout.insights.len() > 0 {
+        actions.push(badge::Badge(#{
+            text: core::human_bytes_short(total),
+            variant: "accent",
+            dot: false,
+        }));
     }
-    column([header] + rows_node)
-        .with_style(style().flex_col().gap(px(4.0)).width(relative(1.0)).flex_grow().overflow_hidden())
+    let content = if layout.insights.len() == 0 {
+        text("Nothing obviously disposable").with_style(
+            style().typography("body_small").text_color(theme_color("text_muted"))
+        )
+    } else {
+        column(rows_node)
+            .with_style(style().flex_col().gap(px(2.0)).width(relative(1.0)).flex_grow().overflow_hidden())
+    };
+    section::Section(#{
+        title: "Worth a look",
+        voice: "label",
+        actions: actions,
+        content: content,
+    })
 }
 
 fn index_of_finding(layout, finding) {
@@ -2734,10 +3551,10 @@ fn index_of_finding(layout, finding) {
     0
 }
 
-/// Disk: how much of the scanned volume is still free.
+/// Disk: how much of the scanned volume is still free — a Stat figure and a
+/// Progress bar for the used share.
 fn disk_panel(scan) {
-    let nodes = [eyebrow("Disk")];
-    if scan.space != () {
+    let content = if scan.space != () {
         let total = scan.space.total;
         let free = scan.space.available;
         let used_fraction = 0.0;
@@ -2745,93 +3562,84 @@ fn disk_panel(scan) {
             used_fraction = (total - free).to_float() / total.to_float();
         }
         let free_parts = split_first_word(core::human_bytes(free));
-        nodes.push(
-            row([
-                text(free_parts[0]).with_style(
-                    style()
-                        .font_size(px(20.0))
-                        .font_weight(300)
-                        .text_color(theme_color("text_primary"))
-                ),
-                text(`${free_parts[1]} free`).with_style(
-                    style()
-                        .font_size(px(11.0))
-                        .text_color(theme_color("text_muted"))
-                        .self_end()
-                        .padding_bottom(px(3.0))
-                        .padding_left(px(4.0))
-                ),
-            ])
-            .with_style(style().flex_row().items_end().padding_y(px(4.0)))
-        );
-        nodes.push(share_bar(used_fraction, theme_color("accent")));
-        nodes.push(
+        column([
+            stat::Stat(#{ label: "free", value: free_parts[0], unit: `${free_parts[1]}` }),
+            progress::Progress(#{
+                key: "disk-usage",
+                label: "Disk usage",
+                value: used_fraction * 100.0,
+                max: 100.0,
+                width: 236,
+            }),
             text(`${core::human_bytes_short(total - free)} used of ${core::human_bytes_short(total)}`).with_style(
-                style().font_size(px(10.0)).text_color(theme_color("text_muted"))
-            )
-        );
-    }
-    column(nodes).with_style(style().flex_col().gap(px(6.0)).width(relative(1.0)).flex_shrink(false))
+                style().typography("caption").text_color(theme_color("text_muted"))
+            ),
+        ])
+        .with_style(style().flex_col().gap(px(8.0)).width(relative(1.0)).flex_shrink(false))
+    } else {
+        text("Volume usage arrives with the first scan.").with_style(
+            style().typography("caption").text_color(theme_color("text_muted"))
+        )
+    };
+    section::Section(#{ title: "Disk", voice: "label", content: content })
 }
 
 // -- help overlay ----------------------------------------------------------------
 
+/// One help row: the chord as real Kbd keycaps, the description beside it.
+fn help_row(keys, description) {
+    row([
+        kbd::Kbd(#{ keys: keys, label: description })
+            .with_style(style().flex_shrink(false).width(theme_length("metrics.label_column"))),
+        text(description).with_style(
+            style()
+                .typography("body_small")
+                .text_color(theme_color("text_muted"))
+                .flex_grow()
+        ),
+    ])
+    .with_style(style().flex_row().items_center().gap(theme_length("space.related")).width(relative(1.0)))
+}
+
 fn help_overlay() {
-    let keys = [
-        ["enter", "open the selected directory"],
-        ["u / ⌫", "up one level"],
-        ["h j k l / arrows", "move between tiles"],
-        ["tab", "next sibling by size"],
-        ["t", "size · files · age"],
-        ["[ ]", "fewer or more levels"],
-        ["- = 0", "zoom out, in, reset"],
-        ["wheel", "zoom toward the pointer"],
-        ["shift + wheel", "pan"],
-        ["i / d", "hidden files · apparent size"],
-        ["r", "rescan"],
-        ["alt ← →", "history back / forward"],
-        ["p", "show or hide this panel"],
-        ["o", "reveal in the file manager"],
-        ["esc", "close · drop selection · up"],
-        ["q", "quit"],
+    let rows = [
+        help_row(["enter"], "open the selected directory"),
+        help_row(["u", "⌫"], "up one level"),
+        help_row(["h", "j", "k", "l"], "move between tiles"),
+        help_row(["tab"], "next sibling by size"),
+        help_row(["t"], "size · files · age"),
+        help_row(["[", "]"], "fewer or more levels"),
+        help_row(["-", "=", "0"], "zoom out, in, reset"),
+        help_row(["wheel"], "zoom toward the pointer"),
+        help_row(["shift", "wheel"], "pan"),
+        help_row(["i", "d"], "hidden files · apparent size"),
+        help_row(["r"], "rescan"),
+        help_row(["e"], "cycle the theme"),
+        help_row(["alt", "←", "→"], "history back / forward"),
+        help_row(["p"], "show or hide this panel"),
+        help_row(["o"], "reveal in the file manager"),
+        help_row(["esc"], "close · drop selection · up"),
+        help_row(["q"], "quit"),
     ];
-    let rows = [];
-    for pair in keys {
-        rows.push(
-            row([
-                w::keycap(pair[0]).with_style(style().flex_shrink(false).width(px(120.0))),
-                text(pair[1]).with_style(
-                    style()
-                        .font_size(px(12.0))
-                        .text_color(theme_color("text_muted"))
-                        .flex_grow()
-                ),
-            ])
-            .with_style(style().flex_row().items_center().gap(px(10.0)).width(relative(1.0)))
-        );
-    }
     box([
         column([
             row([
                 text("keys").with_style(
                     style()
-                        .font_size(px(14.0))
-                        .font_weight(700)
+                        .typography("title")
                         .text_color(theme_color("text_primary"))
                         .flex_grow()
                 ),
-                text("? esc").with_style(
-                    style().font_size(px(11.0)).text_color(theme_color("text_muted"))
-                ),
+                kbd::Kbd(#{ keys: ["?", "esc"], label: "Close help" }),
             ])
-            .with_style(style().flex_row().width(relative(1.0))),
+            .with_style(style().flex_row().items_center().width(relative(1.0))),
         ] + rows)
         .with_style(
             style()
                 .flex_col()
-                .gap(px(8.0))
-                .width(px(460.0))
-                .padding(px(24.0))
+                .gap(theme_spacing("sm"))
+                .width(px(452.0))
+                .padding(theme_length("space.section"))
                 .background(theme_color("surface"))
                 .border(px(1.0))
                 .border_color(theme_color("border"))
@@ -2856,32 +3664,62 @@ fn help_background(ctx, event) {
     ctx.set_state("help_open", false);
 }
 
+/// The status bar: the key legend as inline Kbd, the zoom factor when the
+/// view is magnified, and the scan status at the end — the totals live on
+/// the row above the mosaic now, like tobi's.
 fn footer(scan, layout) {
     let status = if scan.phase == "scanning" {
         `scanning · ${core::human_count(scan.files)} entries · ${core::human_bytes(scan.bytes)}`
-    } else if scan.phase == "done" && layout.valid {
-        let tiles = layout.tiles.len();
-        `${core::human_bytes(scan.bytes)} · ${core::human_count(scan.files)} files · ${core::human_count(scan.dirs)} dirs · ${tiles} tiles`
+    } else if scan.phase == "cancelled" {
+        `scan cancelled · ${core::human_count(scan.files)} entries · r scans again`
+    } else if scan.phase == "done" {
+        let seconds = scan.elapsed_ms / 1000;
+        let tenths = (scan.elapsed_ms % 1000) / 100;
+        `scan ${core::human_count(scan.files)} entries · ${seconds}.${tenths} s`
     } else {
         ""
     };
+    let start = footer_hints();
+    let scale = layout.view.scale;
+    if (scale - 1.0 > 0.01) || (1.0 - scale > 0.01) {
+        let tenths = (scale * 10.0).round().to_int();
+        start.push(
+            text(`${tenths / 10}.${tenths % 10}×`).with_style(
+                style()
+                    .typography("caption")
+                    .text_color(theme_color("text_muted"))
+                    .flex_shrink(false)
+            )
+        );
+    }
+    status_bar::StatusBar(#{
+        label: "disktree status",
+        start: start,
+        end: [
+            kbd::Kbd(#{ keys: ["?"], label: "All keys" }),
+            text(status),
+        ],
+    })
+}
+
+/// One chord + verb pair of the key legend.
+fn footer_hint(keys, label) {
     row([
-        text("enter open · u up · / filter · t mode · [ ] depth · wheel zoom · ? keys").with_style(
-            style().font_size(px(10.0)).text_color(theme_color("text_muted"))
-        ),
-        text(status).with_style(
-            style().font_size(px(10.0)).text_color(theme_color("text_muted"))
-        ),
+        kbd::Kbd(#{ keys: keys, label: label }),
+        text(label),
     ])
-    .with_style(
-        style()
-            .flex_row()
-            .justify_between()
-            .padding_x(px(16.0))
-            .padding_y(px(6.0))
-            .border_top(px(1.0))
-            .border_color(theme_color("border"))
-    )
+    .with_style(style().flex_row().items_center().gap(theme_spacing("xs")).flex_shrink(false))
+}
+
+fn footer_hints() {
+    [
+        footer_hint(["enter"], "open"),
+        footer_hint(["u"], "up"),
+        footer_hint(["/"], "filter"),
+        footer_hint(["t"], "mode"),
+        footer_hint(["[", "]"], "depth"),
+        footer_hint(["?"], "keys"),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -2919,7 +3757,7 @@ fn init(ctx) {
         elapsed_ms: 0,
         now: 0,
     });
-    ctx.set_app_store("disktree", "layout", empty_layout());
+    reset_derived_layout(ctx);
     ctx.set_app_store(
         "disktree",
         "cursor",

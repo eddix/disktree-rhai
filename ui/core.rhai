@@ -189,15 +189,33 @@ fn hit(tiles, x, y) {
 
 fn scaled(bytes) {
     // Returns [value_in_tenths, unit_index]: e.g. 1536 -> [15, 1] (1.5 KiB).
-    // Rounded division, so the 9.95-boundary behaves like the original
-    // (9.95 and up prints as the next whole unit).
-    let value = bytes * 10;
+    // The unit steps at 1023.5 of a unit, not 1024: no decimal is shown at
+    // 10 and up, so anything above it would print as 1024 of this unit
+    // instead of 1.0 of the next (tobi size.rs PR #70). The byte thresholds
+    // below are those boundaries exactly (1024, then 1023.5 * 1024^u); the
+    // unit is chosen against them, and the value is rounded to tenths once
+    // at the end — no intermediate rounding to drift the boundary.
+    let step_bytes = [
+        1024,
+        1048064,
+        1073217536,
+        1098974756864,
+        1125350151028736,
+        1152358554653425664,
+    ];
+    let unit_bytes = [
+        1,
+        1024,
+        1048576,
+        1073741824,
+        1099511627776,
+        1125899906842624,
+    ];
     let unit = 0;
-    let units = 6;
-    while value >= 10240 && unit + 1 < units {
-        value = (value + 512) / 1024;
+    while unit + 1 < 6 && bytes >= step_bytes[unit] {
         unit += 1;
     }
+    let value = (bytes * 10 + unit_bytes[unit] / 2) / unit_bytes[unit];
     [value, unit]
 }
 
@@ -243,19 +261,21 @@ fn human_bytes_short(bytes) {
     `${whole}${size_units()[unit]}`
 }
 
-/// `1.2k`, `3.4M`, `812`: file counts.
+/// `1.2k`, `3.4M`, `812`: file counts. Each bound sits where one decimal
+/// would round up to 1000.0, so 999,999 reads `1.0M`, not `1000.0k`
+/// (tobi's size.rs PR #70).
 fn human_count(count) {
     if count < 10000 {
         return `${count}`;
     }
     let value = count.to_float();
-    if value < 1000000.0 {
+    if value < 999_950.0 {
         return `${fmt_tenths(value / 1000.0)}k`;
     }
-    if value < 1000000000.0 {
-        return `${fmt_tenths(value / 1000000.0)}M`;
+    if value < 999_950_000.0 {
+        return `${fmt_tenths(value / 1_000_000.0)}M`;
     }
-    `${fmt_tenths(value / 1000000000.0)}G`
+    `${fmt_tenths(value / 1_000_000_000.0)}G`
 }
 
 fn fmt_tenths(value) {
@@ -493,26 +513,42 @@ fn mix(a, b, t) {
 /// A tile fill for a category at a nesting depth, dark theme:
 /// s = 0.26*chroma, l = 0.215 + 0.028*depth (depth capped at 4), blended
 /// 12% toward the surface. Returns 0xRRGGBBAA for rgba().
-fn category_fill(category, depth) {
-    category_fill_mode(category, depth, false)
+/// The surface tone of the active mode, 0..1 rgb: fills blend toward it by
+/// depth, and filtered-out tiles step almost all the way to it.
+fn surface_rgb(light) {
+    if light {
+        return [1.0, 0.988, 0.941];
+    }
+    let tone = theme_rgb().surface;
+    [tone[0] / 255.0, tone[1] / 255.0, tone[2] / 255.0]
 }
 
 /// One palette per theme mode. Dark follows tobi's hsl ramp; light inverts
-/// it for Flexoki paper: pale tints that darken slightly with depth.
-fn category_fill_mode(category, depth, light) {
+/// it for Flexoki paper: pale tints that darken slightly with depth. A
+/// filtered-out tile (a needle is being typed and it holds no match) steps
+/// most of the way back to the surface, so only matches keep their colour.
+fn category_fill_mode(category, depth, light, dim) {
     let base = category_base(category);
     let d = if depth > 4 { 4 } else { depth };
-    let rgb = ();
-    let surface = ();
-    if light {
-        rgb = hsl_to_rgb(base.h, 0.55 * base.c, 0.90 - 0.030 * d);
-        surface = [1.0, 0.988, 0.941];
-    } else {
-        rgb = hsl_to_rgb(base.h, 0.26 * base.c, 0.215 + 0.028 * d);
-        surface = [theme_rgb().surface[0] / 255.0, theme_rgb().surface[1] / 255.0, theme_rgb().surface[2] / 255.0];
+    let rgb = hsl_to_rgb(
+        base.h,
+        if light { 0.55 * base.c } else { 0.26 * base.c },
+        if light { 0.90 - 0.030 * d } else { 0.215 + 0.028 * d }
+    );
+    let blend = 0.12;
+    if dim {
+        blend = 0.84;
     }
-    let blended = mix(rgb, surface, 0.12);
-    rgba_bytes(blended, 1.0)
+    rgba_bytes(mix(rgb, surface_rgb(light), blend), 1.0)
+}
+
+/// A resolved fill or accent stepped most of the way toward the surface:
+/// what a filtered-out tile's strip wears while the needle is typed.
+fn dimmed_color(color, light) {
+    let r = ((color / 0x1000000) % 0x100).to_float() / 255.0;
+    let g = ((color / 0x10000) % 0x100).to_float() / 255.0;
+    let b = ((color / 0x100) % 0x100).to_float() / 255.0;
+    rgba_bytes(mix([r, g, b], surface_rgb(light), 0.82), 1.0)
 }
 
 /// The stronger accent for a category's strip and legend chips.
@@ -524,24 +560,26 @@ fn category_accent(category) {
 
 /// The five age buckets' fills, from freshest (theme accent) to oldest
 /// (grey). Used in Age metric mode.
-fn age_fill(age_days) {
-    age_fill_mode(age_days, false)
-}
-
-fn age_fill_mode(age_days, light) {
+fn age_fill_mode(age_days, light, dim) {
+    let rgb = ();
     if light {
         // On paper the ramp darkens with age, from blue ink toward grey.
-        if age_days <= 7 { return rgba_bytes(hsl_to_rgb(0.605, 0.52, 0.55), 1.0); }
-        if age_days <= 30 { return rgba_bytes(hsl_to_rgb(0.605, 0.40, 0.64), 1.0); }
-        if age_days <= 182 { return rgba_bytes(hsl_to_rgb(0.605, 0.28, 0.73), 1.0); }
-        if age_days <= 365 { return rgba_bytes(hsl_to_rgb(0.605, 0.16, 0.80), 1.0); }
-        return rgba_bytes(hsl_to_rgb(0.605, 0.06, 0.86), 1.0);
+        if age_days <= 7 { rgb = hsl_to_rgb(0.605, 0.52, 0.55); }
+        else if age_days <= 30 { rgb = hsl_to_rgb(0.605, 0.40, 0.64); }
+        else if age_days <= 182 { rgb = hsl_to_rgb(0.605, 0.28, 0.73); }
+        else if age_days <= 365 { rgb = hsl_to_rgb(0.605, 0.16, 0.80); }
+        else { rgb = hsl_to_rgb(0.605, 0.06, 0.86); }
+    } else {
+        if age_days <= 7 { rgb = hsl_to_rgb(0.605, 0.30, 0.42); }
+        else if age_days <= 30 { rgb = hsl_to_rgb(0.605, 0.24, 0.34); }
+        else if age_days <= 182 { rgb = hsl_to_rgb(0.605, 0.18, 0.28); }
+        else if age_days <= 365 { rgb = hsl_to_rgb(0.605, 0.12, 0.24); }
+        else { rgb = hsl_to_rgb(0.605, 0.06, 0.20); }
     }
-    if age_days <= 7 { return rgba_bytes(hsl_to_rgb(0.605, 0.30, 0.42), 1.0); }
-    if age_days <= 30 { return rgba_bytes(hsl_to_rgb(0.605, 0.24, 0.34), 1.0); }
-    if age_days <= 182 { return rgba_bytes(hsl_to_rgb(0.605, 0.18, 0.28), 1.0); }
-    if age_days <= 365 { return rgba_bytes(hsl_to_rgb(0.605, 0.12, 0.24), 1.0); }
-    rgba_bytes(hsl_to_rgb(0.605, 0.06, 0.20), 1.0)
+    if dim {
+        return rgba_bytes(mix(rgb, surface_rgb(light), 0.84), 1.0);
+    }
+    rgba_bytes(rgb, 1.0)
 }
 
 /// Age of a node in whole days from its mtime.

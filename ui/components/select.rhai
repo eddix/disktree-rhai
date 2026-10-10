@@ -1,0 +1,131 @@
+/* gpui-rhai
+{
+  "id": "components/select",
+  "export": "Select",
+  "version": "0.2.0",
+  "runtime_api": { "min_inclusive": 3, "max_exclusive": 4 },
+  "dependencies": ["components/combobox"],
+  "capabilities": {},
+  "assets": [],
+  "tokens": ["border", "danger"],
+  "environment": ["size", "density"]
+}
+*/
+// Scalar controlled Select composed from the public Rhai Combobox component.
+// Props: key/label/options/value/open/query/placeholder/searchable/disabled/error/size/width and callbacks.
+// Events: change(optional<string>), open_change(bool), and query_change(string).
+// State: caller owns value/open/query; Combobox owns only active-option navigation.
+// Example: Select(#{ key: "country", label: "Country", options: countries, value: "cn", open: false, query: "", on_change: Fn("changed") })
+
+import "components/combobox" as combobox;
+
+define_component(#{
+    metadata: #{ id: "components/select", "export": "Select", version: "0.2.0",
+        runtime_api: #{ min_inclusive: 3, max_exclusive: 4 },
+        dependencies: ["components/combobox"], capabilities: #{},
+        tokens: ["border", "danger"],
+        environment: ["size", "density"], assets: [] },
+    schema: #{
+        props: #{
+            key: #{ schema: #{ type: "string" }, required: true, sensitive: false },
+            label: #{ schema: #{ type: "string" }, required: true, sensitive: false },
+            options: #{ schema: #{ type: "array", max_items: 100000, items: #{
+                type: "object", allow_unknown: false, fields: #{
+                    value: #{ schema: #{ type: "string" }, required: true, sensitive: false },
+                    label: #{ schema: #{ type: "string" }, required: true, sensitive: false },
+                    disabled: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                        "default": #{ type: "bool", value: false } },
+                    group: #{ schema: #{ type: "optional", value: #{ type: "string" } }, required: false, sensitive: false },
+                    keywords: #{ schema: #{ type: "array", max_items: 32, items: #{ type: "string" } }, required: false, sensitive: false,
+                        "default": #{ type: "array", value: [] } },
+                },
+            } }, required: true, sensitive: false },
+            value: #{ schema: #{ type: "optional", value: #{ type: "string" } }, required: false, sensitive: false },
+            open: #{ schema: #{ type: "bool" }, required: true, sensitive: false },
+            query: #{ schema: #{ type: "string" }, required: true, sensitive: false },
+            placeholder: #{ schema: #{ type: "string" }, required: false, sensitive: false,
+                "default": #{ type: "string", value: "" } },
+            search_placeholder: #{ schema: #{ type: "string" }, required: false, sensitive: false,
+                "default": #{ type: "string", value: "" } },
+            empty_text: #{ schema: #{ type: "string" }, required: false, sensitive: false,
+                "default": #{ type: "string", value: "" } },
+            clear_label: #{ schema: #{ type: "string" }, required: false, sensitive: false,
+                "default": #{ type: "string", value: "Clear" } },
+            clearable: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                "default": #{ type: "bool", value: false } },
+            searchable: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                "default": #{ type: "bool", value: false } },
+            disabled: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                "default": #{ type: "bool", value: false } },
+            error: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
+                "default": #{ type: "bool", value: false } },
+            size: #{ schema: #{ type: "optional", value: #{ type: "string", allowed: ["xs", "sm", "md", "lg"] } },
+                required: false, sensitive: false },
+            width: #{ schema: #{ type: "optional", value: #{ type: "length" } }, required: false, sensitive: false },
+            max_visible: #{ schema: #{ type: "integer", min: 1, max: 32 }, required: false, sensitive: false,
+                "default": #{ type: "integer", value: 8 } },
+            placement: #{ schema: #{ type: "string", allowed: ["top", "bottom", "left", "right"] }, required: false, sensitive: false,
+                "default": #{ type: "string", value: "bottom" } },
+            on_change: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false },
+            on_open_change: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false },
+            on_query_change: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false },
+        },
+        state: #{ fields: #{} },
+        events: #{ change: #{ payload: #{ type: "optional", value: #{ type: "string" } } },
+            open_change: #{ payload: #{ type: "bool" } }, query_change: #{ payload: #{ type: "string" } } },
+        slots: #{},
+        parts: ["root", "trigger", "value", "placeholder", "indicator", "clear",
+            "panel", "search", "list", "group", "option", "option_selected",
+            "option_active", "option_disabled", "empty"],
+    },
+    render: Fn("render_Select")
+});
+
+fn Select(props) { render_component("components/select", props) }
+fn prop_or(props, name, fallback) { if name in props { props[name] } else { fallback } }
+fn select_values(ctx, values) { ctx.emit("change", if values.len == 0 { () } else { values[0] }); }
+fn select_open(ctx, open) { ctx.emit("open_change", open); }
+fn select_query(ctx, query) { ctx.emit("query_change", query); }
+fn render_Select(ctx, props) {
+    let selected = if "value" in props && props.value != () { [props.value] } else { [] };
+    let trigger_style = if prop_or(props, "error", false) {
+        style().border_color(theme_color("danger"))
+    } else { style() };
+    let empty_text = prop_or(props, "empty_text", "");
+    let node = combobox::Combobox(#{
+        key: `${props.key}-combobox`, label: props.label, options: props.options, mode: "single",
+        selected: selected, open: props.open, query: props.query,
+        searchable: prop_or(props, "searchable", false),
+        placeholder: prop_or(props, "placeholder", ""),
+        search_placeholder: prop_or(props, "search_placeholder", ""),
+        empty_text: if empty_text == "" { ctx.t("common.no_results") } else { empty_text },
+        clear_label: prop_or(props, "clear_label", "Clear"),
+        clearable: prop_or(props, "clearable", false), reset_query_on_close: true,
+        disabled: prop_or(props, "disabled", false),
+        max_visible: prop_or(props, "max_visible", 8),
+        placement: prop_or(props, "placement", "bottom"),
+        size: prop_or(props, "size", ()),
+        width: if "width" in props { props.width } else { px(280) },
+        on_change: Fn("select_values"),
+        on_open_change: Fn("select_open"), on_query_change: Fn("select_query"),
+        style: ctx.component_style("root", style()),
+        part_styles: #{
+            trigger: ctx.component_style("trigger", trigger_style),
+            value: ctx.component_style("value", style()),
+            placeholder: ctx.component_style("placeholder", style()),
+            indicator: ctx.component_style("indicator", style()),
+            clear: ctx.component_style("clear", style()),
+            panel: ctx.component_style("panel", style()),
+            search: ctx.component_style("search", style()),
+            list: ctx.component_style("list", style()),
+            group: ctx.component_style("group", style()),
+            option: ctx.component_style("option", style()),
+            option_selected: ctx.component_style("option_selected", style()),
+            option_active: ctx.component_style("option_active", style()),
+            option_disabled: ctx.component_style("option_disabled", style()),
+            empty: ctx.component_style("empty", style()),
+        }
+    }).with_key(props.key);
+    node.accessibility_invalid(prop_or(props, "error", false))
+        .accessibility_value(if selected.len == 0 { () } else { selected[0] })
+}

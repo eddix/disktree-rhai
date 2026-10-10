@@ -1,5 +1,12 @@
 # disktree-rhai feature matrix
 
+**gpui-rhai 0.2 validation status: PASS** (one open upstream issue, G12/#140,
+with a workaround in place). This project exercises the design system's core
+contracts — token base, 15 official components, 4 layouts/patterns, 16
+palettes, custom TitleBar chrome, canvas BYOD, capability model, skin
+system, and the acceptance toolchain (skin_check / key_harness /
+screenshot).
+
 Scope reference: tobi/disktree defines visual & interaction fidelity,
 remorses/gpuix (disktree clone) defines the v1 feature set. ✅ shipped ·
 🟡 partial · ❌ intentionally out of v1 (see DESIGN.md).
@@ -27,6 +34,9 @@ remorses/gpuix (disktree clone) defines the v1 feature set. ✅ shipped ·
 | depth 1–6 (`[` `]`) | ✅ | ✅ | ✅ |
 | canvas tiling, ≤150 labels by area | ✅ | ✅ | ✅ |
 | category colours / age colours (`t`) | ✅ | ❌ | ✅ |
+| colour legend (categories / age ramp / reclaimable) | ✅ | ❌ | ✅ |
+| scan totals line above the mosaic | ✅ | ❌ | ✅ |
+| size/count unit step at 1023.5 (PR #70 parity) | ✅ | ❌ | ✅ edge-tested |
 | zoom/pan without re-layout (view transform) | ✅ | ❌ | ✅ |
 | growth animation on enter/ascend | ✅ | ❌ | ❌ v1.5 |
 | **tiling algorithm swappable per skin** | n/a | n/a | ✅ minimal skin ships slice-and-dice |
@@ -47,6 +57,8 @@ remorses/gpuix (disktree clone) defines the v1 feature set. ✅ shipped ·
 | `-` `=` `0` centred zoom | ✅ | ❌ | ✅ |
 | click select · re-click enter · double-click | ✅ | ✅ | ✅ |
 | `/`/`s` typeahead filter (Whole/Partial keeps) | ✅ | ❌ | ✅ |
+| dim-while-typing (only matches keep colour) | ✅ | ❌ | ✅ tree.kept per tile |
+| right-click reveals the tile | ✅ | ❌ | ✅ |
 | `o` reveal in file manager | ✅ | ✅ | ✅ xdg-open |
 | `q` quit | ✅ | ❌ | ✅ |
 | `?` help overlay | ✅ | ❌ | ✅ |
@@ -58,17 +70,32 @@ remorses/gpuix (disktree clone) defines the v1 feature set. ✅ shipped ·
 |---|---|---|---|
 | scan panel (progress, stats, cancel/retry) | ✅ | ✅ | ✅ |
 | hover tooltip card | ✅ | ✅ | ✅ |
-| sidebar: Selection | ✅ | ✅ | ✅ |
+| sidebar: Selection (incl. git state of checkouts) | ✅ | ❌ | ✅ disktree.git capability |
+| sidebar drag-resize + responsive hide <52rem | ✅ | ❌ | ✅ official SplitPane |
+| crumb ▾ sibling menu (share bars, keyboard) | ✅ | ❌ | ✅ official Popover |
+| navigation growth animation (enter/ascend) | ✅ | ❌ | ✅ timer-stepped view lerp |
 | sidebar: Worth a look (insights) | ✅ | ✅ | ✅ 3 finding kinds |
 | sidebar: Disk (free space) | ✅ | ✅ | ✅ |
 | mode segmented / checkboxes / depth stepper | ✅ | ✅ | ✅ |
-| key bar footer | ✅ | ✅ | ✅ |
+| key bar footer (keycap Kbd hints · zoom factor · scan status) | ✅ | ✅ | ✅ |
+| ghost-style theme Select (part_styles trigger override) | n/a | n/a | ✅ |
+| signal-driven panel drag (zero Rhai re-render per pixel) | n/a | n/a | ✅ optional_float_signal |
+| custom TitleBar replacing the platform bar (drag + double-press zoom) | n/a | n/a | ✅ official TitleBar, window_drag_areas |
+| offscreen screenshot tool (`cargo run --example screenshot`) | n/a | n/a | ✅ docs/screenshots are its output |
+
+## The plus: themes
+
+| Capability | disktree-rhai |
+|---|---|
+| 17 mounted palettes (skin's 2 + gpui-rhai's 15 bundled) | ✅ |
+| theme Select in the controls + `e` cycle key | ✅ |
+| follows `--theme` / Omarchy / system appearance at start | ✅ |
 
 ## Not in v1 (v1.5 / by design)
 
 Deletion system (marks, review, trash) — excluded by design (gpuix scope).
-Volumes `v`, whole-disk `g`, cross-fs options, growth animation, rem
-scaling — v1.5.
+Volumes `v`, whole-disk `g`, cross-fs options, rem scaling — v1.5. Growth
+animation shipped (timer-stepped view lerp on enter/ascend).
 
 ## The plus: skins
 

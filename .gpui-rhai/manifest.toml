@@ -1,0 +1,101 @@
+runtime_api = 3
+
+[components."components/badge"]
+version = "0.2.0"
+content_hash = "b02152f557c7b567"
+dependencies = []
+
+[components."components/button"]
+version = "0.2.0"
+content_hash = "bb287ccedc9064a9"
+dependencies = []
+
+[components."components/checkbox"]
+version = "0.2.0"
+content_hash = "5c784a9e3114a0cd"
+dependencies = []
+
+[components."components/combobox"]
+version = "0.2.0"
+content_hash = "67f58fb83137479e"
+dependencies = [ "components/input",]
+
+[components."components/divider"]
+version = "0.2.0"
+content_hash = "3254ba37d53c17b6"
+dependencies = []
+
+[components."components/input"]
+version = "0.2.0"
+content_hash = "4fd7d7e188d4dbcb"
+dependencies = []
+
+[components."components/kbd"]
+version = "0.2.0"
+content_hash = "ff24e956ae4540fe"
+dependencies = []
+
+[components."components/popover"]
+version = "0.2.0"
+content_hash = "2cdf2f7eca5f82db"
+dependencies = []
+
+[components."components/progress"]
+version = "0.2.0"
+content_hash = "62cdcab95e9b4199"
+dependencies = []
+
+[components."components/select"]
+version = "0.2.0"
+content_hash = "7857fcb01dba7e81"
+dependencies = [ "components/combobox",]
+
+[components."components/spinner"]
+version = "0.2.0"
+content_hash = "15e71a2986fabdfa"
+dependencies = []
+
+[components."components/split_pane"]
+version = "0.2.0"
+content_hash = "affe27faefe89d2f"
+dependencies = []
+
+[components."components/status_bar"]
+version = "0.2.0"
+content_hash = "b0717e76f2131dc0"
+dependencies = []
+
+[components."components/title_bar"]
+version = "0.2.0"
+content_hash = "0cc58ee30acdaba0"
+dependencies = []
+
+[components."components/toggle_group"]
+version = "0.2.0"
+content_hash = "fc9da796d8c7f4b0"
+dependencies = []
+
+[components."layouts/toolbar"]
+version = "0.2.0"
+content_hash = "3993407c1889f951"
+dependencies = []
+
+[components."patterns/description_list"]
+version = "0.2.0"
+content_hash = "645693a3de13da4a"
+dependencies = []
+
+[components."patterns/section"]
+version = "0.2.0"
+content_hash = "af76a2e3c39a50ef"
+dependencies = []
+
+[components."patterns/stat"]
+version = "0.2.0"
+content_hash = "6d6ed80dd39a03c2"
+dependencies = []
+
+[components."layouts/inline"]
+version = "0.2.0"
+content_hash = "2d56da733646e51b"
+dependencies = []

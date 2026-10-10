@@ -1,7 +1,8 @@
-// disktree-rhai default theme — Tokyo Night based, matching tobi/disktree's
-// dark fallback (Tokyo Night) with disktree's zero-radius Omarchy-style scale.
-// Category palette constants live in core.rhai; they derive fills from these
-// surface/accent tokens at render time.
+// disktree-rhai default palette — Tokyo Night, matching tobi/disktree's dark
+// fallback. gpui-rhai 0.2: palettes own colors only; typography, spacing,
+// metrics and radii come from the token base (ui/tokens.rhai), so switching
+// palette never changes layout. Category palette constants live in core.rhai;
+// they derive fills from these surface/accent tokens at render time.
 fn theme() {
     #{
         family: "Disktree",
@@ -28,38 +29,6 @@ fn theme() {
                 selection: 0x292e42ff,
                 disabled: 0x565f89ff,
                 scrim: 0x10121bcc,
-            },
-            spacing: #{
-                xxs: #{ unit: "pixels", value: 2.0 },
-                xs: #{ unit: "pixels", value: 4.0 },
-                sm: #{ unit: "pixels", value: 8.0 },
-                md: #{ unit: "pixels", value: 12.0 },
-                lg: #{ unit: "pixels", value: 16.0 },
-            },
-            radii: #{
-                sm: #{ unit: "pixels", value: 0.0 },
-                md: #{ unit: "pixels", value: 0.0 },
-                lg: #{ unit: "pixels", value: 0.0 },
-            },
-            typography: #{
-                roles: #{
-                    caption: #{ size: #{ unit: "pixels", value: 11.0 },
-                        line_height: #{ unit: "pixels", value: 16.0 }, weight: 400 },
-                    body_small: #{ size: #{ unit: "pixels", value: 12.0 },
-                        line_height: #{ unit: "pixels", value: 16.0 }, weight: 400 },
-                    body: #{ size: #{ unit: "pixels", value: 13.0 },
-                        line_height: #{ unit: "pixels", value: 18.0 }, weight: 400 },
-                    subtitle: #{ size: #{ unit: "pixels", value: 14.0 },
-                        line_height: #{ unit: "pixels", value: 20.0 }, weight: 400 },
-                    title: #{ size: #{ unit: "pixels", value: 16.0 },
-                        line_height: #{ unit: "pixels", value: 22.0 }, weight: 700 },
-                    heading: #{ size: #{ unit: "pixels", value: 18.0 },
-                        line_height: #{ unit: "pixels", value: 24.0 }, weight: 700 },
-                    display: #{ size: #{ unit: "pixels", value: 24.0 },
-                        line_height: #{ unit: "pixels", value: 32.0 }, weight: 700 },
-                    display_large: #{ size: #{ unit: "pixels", value: 28.0 },
-                        line_height: #{ unit: "pixels", value: 36.0 }, weight: 700 },
-                },
             },
         },
     }
