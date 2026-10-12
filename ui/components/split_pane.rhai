@@ -15,18 +15,17 @@
 // `size` is the controlled start-panel ratio. Pointer moves update only a
 // native signal; `on_resize` fires once when a drag ends or a keyboard step is
 // requested. If the Host rejects that value, the preview returns to `size`.
-// Props: key, label, orientation, size, panel nodes/keys, constraints, collapse, disabled,
-//        handle (a decorative grip node), line (default true), line_inset (default 4).
-// Events: resize(number) proposes the next controlled start-panel ratio once.
 // State: only native pointer preview; application ratio and collapse remain controlled.
-// Parts: root, start, handle, end, grip, grip_hover, grip_drag, grip_focus, grip_disabled.
 //
 // `handle` is decoration: it sits in a `grip` box centred on the separator and painted above
 // both panes, and pressing anywhere on that box, overhang included, starts the drag. The
 // keyboard steps, the separator role and the tab stop stay on the native handle. The grip
 // takes the `grip_<state>` part while the handle is hovered, dragged, focused or disabled,
-// from a native signal, so pointer moves never re-render Rhai. `line: false` drops the
-// native line for a grip that draws its own.
+// from a native signal, so pointer moves never re-render Rhai. The handle itself takes
+// `handle_hover` and `handle_drag` the same way (the `surface_hover` fill by default); give
+// them the `handle` background to keep the lane still. `line: false` drops the native line
+// for a grip that draws its own. Each pane is a flex column, so content with `flex_grow`
+// fills it, and absolute content is placed from the pane's corner.
 // Example: SplitPane(#{ key:"main", label:"Resize panes", size:0.35,
 //     start:navigation, end:content, on_resize:Fn("resized") })
 
@@ -38,43 +37,62 @@ define_component(#{
     schema: #{
         props: #{
             key: #{ schema: #{ type: "string" }, required: true, sensitive: false },
-            label: #{ schema: #{ type: "string" }, required: true, sensitive: false },
+            label: #{ schema: #{ type: "string" }, required: true, sensitive: false,
+                doc: "Accessible name of the separator." },
             orientation: #{ schema: #{ type: "string", allowed: ["horizontal", "vertical"] },
                 required: false, sensitive: false,
-                "default": #{ type: "string", value: "horizontal" } },
-            size: #{ schema: #{ type: "number", min: 0.0, max: 1.0 }, required: true, sensitive: false },
+                "default": #{ type: "string", value: "horizontal" },
+                doc: "`horizontal` puts the panes side by side; `vertical` stacks them." },
+            size: #{ schema: #{ type: "number", min: 0.0, max: 1.0 }, required: true, sensitive: false,
+                doc: "Start-pane share of the group's length; the caller stores the `resize` payload and passes it back." },
             min_start: #{ schema: #{ type: "number", min: 0.0, max: 16384.0 }, required: false,
-                sensitive: false, "default": #{ type: "float", value: 120.0 } },
+                sensitive: false, "default": #{ type: "float", value: 120.0 },
+                doc: "Smallest start-pane length a drag or key step may propose, in logical pixels." },
             min_end: #{ schema: #{ type: "number", min: 0.0, max: 16384.0 }, required: false,
-                sensitive: false, "default": #{ type: "float", value: 120.0 } },
+                sensitive: false, "default": #{ type: "float", value: 120.0 },
+                doc: "Smallest end-pane length a drag or key step may leave, in logical pixels." },
             max_start: #{ schema: #{ type: "number", min: 0.0, max: 16384.0 }, required: false,
-                sensitive: false, "default": #{ type: "float", value: 16384.0 } },
+                sensitive: false, "default": #{ type: "float", value: 16384.0 },
+                doc: "Largest start-pane length a drag or key step may propose, in logical pixels; at least `min_start`." },
             start_key: #{ schema: #{ type: "string" }, required: false, sensitive: false,
-                "default": #{ type: "string", value: "start" } },
+                "default": #{ type: "string", value: "start" },
+                doc: "Key of the start pane's wrapper; keep it stable so the pane is not remounted." },
             end_key: #{ schema: #{ type: "string" }, required: false, sensitive: false,
-                "default": #{ type: "string", value: "end" } },
-            start: #{ schema: #{ type: "node" }, required: true, sensitive: false },
-            end: #{ schema: #{ type: "node" }, required: true, sensitive: false },
+                "default": #{ type: "string", value: "end" },
+                doc: "Key of the end pane's wrapper; keep it stable so the pane is not remounted." },
+            start: #{ schema: #{ type: "node" }, required: true, sensitive: false,
+                doc: "Content of the start pane: the leading side, or the top when `vertical`." },
+            end: #{ schema: #{ type: "node" }, required: true, sensitive: false,
+                doc: "Content of the end pane: the trailing side, or the bottom when `vertical`." },
             start_collapsed: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
-                "default": #{ type: "bool", value: false } },
+                "default": #{ type: "bool", value: false },
+                doc: "Hides the start pane and the separator so the end pane fills the group; not with `end_collapsed`." },
             end_collapsed: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
-                "default": #{ type: "bool", value: false } },
+                "default": #{ type: "bool", value: false },
+                doc: "Hides the end pane and the separator so the start pane fills the group; not with `start_collapsed`." },
             keyboard_step: #{ schema: #{ type: "number", exclusive_min: 0.0, max: 512.0 },
-                required: false, sensitive: false, "default": #{ type: "float", value: 8.0 } },
+                required: false, sensitive: false, "default": #{ type: "float", value: 8.0 },
+                doc: "Logical pixels one arrow-key press on the focused separator moves it." },
             disabled: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
-                "default": #{ type: "bool", value: false } },
-            handle: #{ schema: #{ type: "optional", value: #{ type: "node" } }, required: false, sensitive: false },
+                "default": #{ type: "bool", value: false },
+                doc: "Ignores drags and key steps and removes the separator from the tab order." },
+            handle: #{ schema: #{ type: "optional", value: #{ type: "node" } }, required: false, sensitive: false,
+                doc: "Decorative grip node centred on the separator above both panes; pressing it starts the drag." },
             line: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
-                "default": #{ type: "bool", value: true } },
+                "default": #{ type: "bool", value: true },
+                doc: "Paints the native line down the separator; set `false` when `handle` draws its own." },
             line_inset: #{ schema: #{ type: "number", min: 0.0, max: 256.0 }, required: false,
-                sensitive: false, "default": #{ type: "float", value: 4.0 } },
+                sensitive: false, "default": #{ type: "float", value: 4.0 },
+                doc: "How far the native line stops short of each end of the separator, in logical pixels." },
             on_resize: #{ schema: #{ type: "optional", value: #{ type: "callback" } },
-                required: false, sensitive: false },
+                required: false, sensitive: false,
+                doc: "Called with the proposed start-pane ratio when a drag ends or an arrow key moves the separator." },
         },
         state: #{ fields: #{} },
-        events: #{ resize: #{ payload: #{ type: "number", min: 0.0, max: 1.0 } } },
-        slots: #{}, parts: ["root", "start", "handle", "end", "grip", "grip_hover", "grip_drag",
-            "grip_focus", "grip_disabled"],
+        events: #{ resize: #{ payload: #{ type: "number", min: 0.0, max: 1.0 },
+            doc: "Emitted once when a drag ends or a key step moves the separator; a drag or step that leaves it in place emits nothing. The payload is the next `size`." } },
+        slots: #{}, parts: ["root", "start", "handle", "handle_hover", "handle_drag", "end", "grip",
+            "grip_hover", "grip_drag", "grip_focus", "grip_disabled"],
     },
     render: Fn("render_SplitPane")
 });
@@ -124,6 +142,8 @@ fn split_key(ctx, payload) {
     let next = if start_size + delta < minimum { minimum }
         else if start_size + delta > maximum { maximum }
         else { start_size + delta };
+    // A step against a limit changes nothing and proposes nothing.
+    if (next - start_size).abs() <= 0.5 { return; }
     ctx.emit("resize", if next <= 0.0 { 0.0 } else { next / group_size });
 }
 
@@ -140,26 +160,29 @@ fn render_SplitPane(ctx, props) {
     let handle_ref_key = `${props.key}-handle-ref`;
     let handle_ref = element_ref(handle_ref_key);
     let root_style = style().width(relative(1.0)).height(relative(1.0)).min_width(px(0)).min_height(px(0));
+    // A pane is a flex column: a child with `flex_grow` is as tall as the pane, so a stage
+    // whose children are all absolute does not collapse to nothing.
+    let pane_style = style().flex_col().min_width(px(0)).min_height(px(0));
     if props.start_collapsed {
         return box([box([props.end]).with_key(props.end_key).with_style(ctx.component_style("end",
-            style().width(relative(1.0)).height(relative(1.0)).min_width(px(0)).min_height(px(0))))])
+            pane_style.width(relative(1.0)).height(relative(1.0))))])
             .with_key(root_ref_key).with_style(ctx.component_style("root", root_style)).with_ref(root_ref);
     }
     // A collapsed side keeps the other pane's key, so collapsing never remounts it.
     if props.end_collapsed {
         return box([box([props.start]).with_key(start_ref_key).with_style(ctx.component_style("start",
-            style().width(relative(1.0)).height(relative(1.0)).min_width(px(0)).min_height(px(0))))])
+            pane_style.width(relative(1.0)).height(relative(1.0))))])
             .with_key(root_ref_key).with_style(ctx.component_style("root", root_style)).with_ref(root_ref);
     }
 
     let preview = optional_float_signal("start-size");
-    let start_style = style().min_width(px(0)).min_height(px(0)).flex_shrink(false);
-    let end_style = style().min_width(px(0)).min_height(px(0)).flex_grow();
+    let start_style = pane_style.flex_shrink(false);
+    let end_style = pane_style.flex_grow();
     // The 8px grab zone: the native handle draws the hairline down its middle (`line`,
-    // `line_inset`); hover fills the zone with the tonal step and keyboard focus turns it
-    // into an ink bar.
+    // `line_inset`); hover and drag fill the zone with the tonal step (`handle_hover`,
+    // `handle_drag`) and keyboard focus turns it into an ink bar. The native handle takes
+    // the pointer, so hover comes from its state signal rather than a `hover` style.
     let handle_style = style().flex_shrink(false)
-        .hover(style().background(theme_color("surface_hover")))
         .focus(style().background(theme_color("focus_ring")));
     if horizontal {
         start_style = start_style.width(relative(props.size)).height(relative(1.0));
@@ -180,11 +203,11 @@ fn render_SplitPane(ctx, props) {
         max_start: props.max_start, disabled: props.disabled,
         signal: preview, group_ref: root_ref, start_ref: start_ref,
         line: split_prop(props, "line", true), line_inset: split_prop(props, "line_inset", 4.0) };
+    let state = signal("handle-state", "idle");
+    resize_props.state_signal = state;
     let grip = ();
     if has_grip {
         let grip_ref = element_ref(`${props.key}-grip`);
-        let state = signal("handle-state", "idle");
-        resize_props.state_signal = state;
         resize_props.handle_ref = grip_ref;
         grip = split_grip(ctx, props, horizontal, grip_ref, state);
     }
@@ -196,6 +219,10 @@ fn render_SplitPane(ctx, props) {
     let handle = gpui_rhai::SplitResizePrimitive(resize_props)
         .with_key(`${props.key}-separator`).with_ref(handle_ref)
         .with_style(ctx.component_style("handle", handle_style))
+        .signal_style(state, #{
+            hover: ctx.component_style("handle_hover", style().background(theme_color("surface_hover"))),
+            drag: ctx.component_style("handle_drag", style().background(theme_color("surface_hover"))),
+        })
         .disabled(props.disabled)
         .tab_stop(!props.disabled)
         .accessibility_role("separator")

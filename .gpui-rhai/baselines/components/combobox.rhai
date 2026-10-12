@@ -2,7 +2,7 @@
 {
   "id": "components/combobox",
   "export": "Combobox",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "runtime_api": { "min_inclusive": 3, "max_exclusive": 4 },
   "dependencies": ["components/input"],
   "capabilities": {},
@@ -24,7 +24,7 @@
 import "components/input" as input;
 
 define_component(#{
-    metadata: #{ id: "components/combobox", "export": "Combobox", version: "0.2.0",
+    metadata: #{ id: "components/combobox", "export": "Combobox", version: "0.2.1",
         runtime_api: #{ min_inclusive: 3, max_exclusive: 4 },
         dependencies: ["components/input"], capabilities: #{},
         tokens: [
@@ -65,7 +65,7 @@ define_component(#{
                 "default": #{ type: "string", value: "single" },
                 doc: "With `single`, a pick replaces the selection and closes the panel; with `multiple`, picks toggle values and it stays open." },
             selected: #{ schema: #{ type: "array", max_items: 100000, items: #{ type: "string" } }, required: true, sensitive: false,
-                doc: "Selected option values, at most one in `single` mode; the caller stores the `change` payload and passes it back." },
+                doc: "Selected option values, at most one in `single` mode, kept when no option has them (the trigger then shows the value itself); the caller stores the `change` payload and passes it back." },
             open: #{ schema: #{ type: "bool" }, required: true, sensitive: false,
                 doc: "Whether the panel is open; the caller stores the `open_change` payload and passes it back." },
             searchable: #{ schema: #{ type: "bool" }, required: false, sensitive: false,
@@ -113,6 +113,8 @@ define_component(#{
                 doc: "Called with the requested open state when the trigger is clicked, an arrow key opens it, a `single` pick closes it, or it is dismissed." },
             on_query_change: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false,
                 doc: "Called with the new search text as the user types, and with `\"\"` when `reset_query_on_close` resets it." },
+            on_submit: #{ schema: #{ type: "optional", value: #{ type: "callback" } }, required: false, sensitive: false,
+                doc: "Called with the query when Enter is pressed in the search field and no enabled option matches it, so typed free text can be taken; while an option is active Enter picks it instead." },
         },
         state: #{ fields: #{
             active: #{ schema: #{ type: "string" }, "default": #{ type: "string", value: "" } },
@@ -124,6 +126,8 @@ define_component(#{
                 doc: "Emitted when the panel should open or close; the payload is the requested open state." },
             query_change: #{ payload: #{ type: "string" },
                 doc: "Emitted when the search text changes, or resets to `\"\"` under `reset_query_on_close`; the payload is the new query." },
+            submit: #{ payload: #{ type: "string" },
+                doc: "Emitted when Enter is pressed in the search field while no enabled option matches the query, only with `on_submit` set; the payload is the query. The panel stays open." },
         },
         slots: #{
             trigger: #{ required: false, multiple: false, doc: "Replaces the default field trigger." },
@@ -141,6 +145,11 @@ define_component(#{
 
 fn Combobox(props) { render_component("components/combobox", props) }
 
+// Square option rows clear the panel's corner: every side pads by half of radius.lg, so
+// nothing in the square style, where rows bleed to the hairline, and 2px or 4px in the
+// subtle and round styles. Menu and Command pad their panels the same way.
+fn list_panel_padding() { theme_radius("lg") * 0.5 }
+
 // The 2px focus frame, drawn over the panel's edge while the panel itself holds focus: the
 // panel's hairline (painted over its children) turns the focus color and this frame adds
 // the inner pixel. A control inside shows its own frame instead.
@@ -156,6 +165,8 @@ fn option_group(option) {
     if "group" in option && option.group != () { option.group } else { () }
 }
 
+// Returns the option values as a map from value to true. A selected value no option has is
+// not an error: options often arrive after the first render, or are cleared while they reload.
 fn validate_combobox(props, selected) {
     let values = #{};
     for option in props.options {
@@ -174,9 +185,7 @@ fn validate_combobox(props, selected) {
     if prop_or(props, "mode", "single") == "single" && selected.len > 1 {
         throw "single-select combobox cannot contain multiple selected values";
     }
-    for value in selected {
-        if !(value in values) { throw `combobox selection '${value}' does not match an option`; }
-    }
+    values
 }
 
 fn option_matches(option, query) {
@@ -261,6 +270,10 @@ fn query_action(ctx, value) {
     ctx.emit("query_change", value);
     handled()
 }
+fn submit_action(ctx, value) {
+    ctx.emit("submit", value);
+    handled()
+}
 fn navigate_action(ctx, payload) {
     ctx.set_state("active", payload.active);
     if payload.open {
@@ -268,18 +281,24 @@ fn navigate_action(ctx, payload) {
     }
     handled()
 }
-fn option_action(ctx, payload) {
-    ctx.set_state("active", payload.active);
-    if payload.changed {
-        ctx.emit("change", payload.selected);
+// A pick builds the next selection for the picked option alone, from the selection the
+// combobox was rendered with, so the option rows carry only their selected flag.
+fn option_action(mode, selected, reset_query, ctx, value) {
+    let next = selection_for(selected, value, mode);
+    ctx.set_state("active", value);
+    if selection_changed(selected, next) {
+        ctx.emit("change", next);
     }
-    if payload.close {
+    if mode == "single" {
         ctx.emit("open_change", false);
-        if payload.reset_query {
+        if reset_query {
             ctx.emit("query_change", "");
         }
     }
     handled()
+}
+fn pick_action(mode, selected, reset_query) {
+    Fn("option_action").curry(mode).curry(selected).curry(reset_query)
 }
 fn clear_action(ctx, payload) {
     if payload.changed {
@@ -300,7 +319,7 @@ fn combobox_indicator(ctx) {
         .width(px(2)).background(theme_color("accent"))))
 }
 
-fn render_combobox_row(total_rows, ctx, payload) {
+fn render_combobox_row(total_rows, mode, selected, reset_query, ctx, payload) {
     let item = payload.item;
     if item.kind == "group" {
         // Group labels align with option text, after the reserved check column.
@@ -343,12 +362,12 @@ fn render_combobox_row(total_rows, ctx, payload) {
         .accessibility_option(item.label, item.selected, payload.index + 1, total_rows)
         .accessibility_value(item.value);
     if item.disabled { node }
-    else { node.on_click_value(Fn("option_action"), item.action) }
+    else { node.on_click_value(pick_action(mode, selected, reset_query), item.value) }
 }
 
 fn render_Combobox(ctx, props) {
     let selected = props.selected;
-    validate_combobox(props, selected);
+    let values = validate_combobox(props, selected);
     let open = props.open;
     let query = props.query;
     let query_lower = query.to_lower();
@@ -356,11 +375,13 @@ fn render_Combobox(ctx, props) {
     let reset_query = prop_or(props, "reset_query_on_close", false);
     let width = if "width" in props && props.width != () { props.width } else { px(280) };
 
+    let chosen = #{};
+    for value in selected { chosen[value] = true; }
     let group_order = [];
     let buckets = #{};
     let labels = [];
     for option in props.options {
-        if selected_contains(selected, option.value) { labels.push(option.label); }
+        if option.value in chosen { labels.push(option.label); }
         if option_matches(option, query_lower) {
             let group = option_group(option);
             let group_key = if group == () { "u:" } else { `g:${group}` };
@@ -373,24 +394,26 @@ fn render_Combobox(ctx, props) {
             buckets[group_key] = bucket;
         }
     }
+    // A selected value no option has stays selected and shows as its own text, after the
+    // known labels, so the user sees the stored selection; the list has no row for it.
+    for value in selected { if !(value in values) { labels.push(value); } }
     let ordered = [];
     for group in group_order { for option in buckets[group.key] { ordered.push(option); } }
     let active = active_value(ordered, selected, ctx.get_state("active"));
     let enabled = enabled_options(ordered);
 
+    // The rows stay linear in the options: each carries its selected flag, and the selection
+    // reaches the row renderer and the Enter handlers once, so the data does not grow with
+    // options times selected values.
     let data = [];
     for group in group_order {
         if group.label != () {
             data.push(#{ key: `group:${group.key}`, kind: "group", label: group.label });
         }
         for option in buckets[group.key] {
-            let next = selection_for(selected, option.value, mode);
             data.push(#{ key: `option:${option.value}`, kind: "option", value: option.value,
                 label: option.label, disabled: option_disabled(option),
-                selected: selected_contains(selected, option.value), active: option.value == active,
-                action: #{ selected: next, active: option.value,
-                    changed: selection_changed(selected, next), close: mode == "single",
-                    reset_query: reset_query } });
+                selected: option.value in chosen, active: option.value == active });
         }
     }
 
@@ -402,11 +425,14 @@ fn render_Combobox(ctx, props) {
     let custom_trigger = "trigger" in props && props.trigger != ();
     let trigger_children = [];
     if !custom_trigger {
+        // One line that gives way first: a long label or placeholder ends in an ellipsis so the
+        // clear button and the chevron stay inside a fixed-width trigger.
         trigger_children.push(text(if selected_label == "" { placeholder } else { selected_label })
             .with_key(`${props.key}-trigger-value`)
             .with_style(ctx.component_style(
                 if selected_label == "" { "placeholder" } else { "value" },
-                style().flex_grow().text_color(if selected_label == "" { theme_color("text_muted") }
+                style().flex_grow().min_width(px(0)).whitespace_nowrap().text_ellipsis()
+                    .text_color(if selected_label == "" { theme_color("text_muted") }
                     else { theme_color("text_primary") }))));
         let trigger_actions = [];
         if prop_or(props, "clearable", false) && selected.len > 0 {
@@ -473,7 +499,8 @@ fn render_Combobox(ctx, props) {
         if open {
             for item in data {
                 if item.kind == "option" && item.value == active {
-                    trigger = trigger.on_key_value("enter", Fn("option_action"), item.action);
+                    trigger = trigger.on_key_value("enter",
+                        pick_action(mode, selected, reset_query), item.value);
                 }
             }
         }
@@ -485,12 +512,18 @@ fn render_Combobox(ctx, props) {
     if header { content.push(props.header); }
     if searchable {
         // The search spans the panel on the rows' inset; without a header it heads the panel.
-        content.push(input::Input(#{
+        let search = #{
             key: `${props.key}-search`, label: props.label, value: query,
             placeholder: prop_or(props, "search_placeholder", "Search"),
             appearance: "embedded",
             on_change: Fn("query_action")
-        }).with_style(ctx.component_style("search", style())));
+        };
+        // With nothing to pick, Enter in the field submits the typed text; otherwise it reaches
+        // the panel, which picks the active option.
+        if enabled.len == 0 && "on_submit" in props && props.on_submit != () {
+            search.on_submit = Fn("submit_action");
+        }
+        content.push(input::Input(search).with_style(ctx.component_style("search", style())));
     }
     if ordered.len == 0 {
         content.push(if "empty" in props && props.empty != () { props.empty }
@@ -507,7 +540,8 @@ fn render_Combobox(ctx, props) {
             key: `${props.key}-options`, label: props.label,
             data: data, estimated_height: 32, fill_height: true,
             overdraw_pixels: 64, alignment: "top", follow_tail: false
-        }, Fn("render_combobox_row").curry(data.len))])
+        }, Fn("render_combobox_row").curry(data.len).curry(mode).curry(selected)
+            .curry(reset_query))])
             .with_style(ctx.component_style("list", style()
                 .height(theme_length("metrics.row") * visible))));
     }
@@ -516,8 +550,7 @@ fn render_Combobox(ctx, props) {
     let panel = column(content).with_key(`${props.key}-panel`)
         .with_style(ctx.component_style("panel",
             style().relative().width(if custom_trigger { width } else { relative(1.0) })
-            .min_width(px(0)).gap(theme_spacing("xs")).padding_y(theme_spacing("xs"))
-                .padding_top(if searchable && !header { px(0) } else { theme_spacing("xs") })
+            .min_width(px(0)).gap(theme_spacing("xs")).padding(list_panel_padding())
                 .border(px(1)).border_color(theme_color("border"))
                 .radius(theme_radius("lg")).background(theme_color("surface_raised"))
                 .focus(style().border_color(theme_color("focus_ring")))))
@@ -535,7 +568,8 @@ fn render_Combobox(ctx, props) {
                 #{ active: edge_value(enabled, true), open: false });
         for item in data {
             if item.kind == "option" && item.value == active {
-                panel = panel.on_key_value("enter", Fn("option_action"), item.action);
+                panel = panel.on_key_value("enter",
+                    pick_action(mode, selected, reset_query), item.value);
             }
         }
         if !prop_or(props, "searchable", false) {

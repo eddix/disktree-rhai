@@ -216,10 +216,11 @@ around locally, or accepted).
   SplitPane (and any native resize primitive wrapper) correctly, or gate
   the grips rework behind it; a story with an absolute child in each pane
   would have caught it.
-- **Re-tested 2026-10-09**: still broken after 26 further upstream commits
-  (including `fix(split-pane)` and the Gallery's own SplitPane layout);
-  the official component with the mosaic in either pane reproduces the
-  blank. The hand-rolled drag stays.
+- **Re-tested 2026-10-12 (0.2.1)**: #140's fix (2b29cbb) resolved the
+  direct case — a bare absolute node in a pane renders. But the mosaic's
+  pattern (a wrapper box with flex_grow + relative + overflow_hidden
+  containing absolute children) still renders blank. Filed as #156.
+  The hand-rolled drag stays until #156 is fixed.
 
 ## Verified non-gaps (accused, then cleared)
 

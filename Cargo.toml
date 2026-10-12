@@ -11,8 +11,8 @@ name = "disktree-rhai"
 path = "src/main.rs"
 
 [dependencies]
-gpui-rhai = "0.2.0"
-gpui-rhai-registry = "0.2.0"
+gpui-rhai = "0.2.1"
+gpui-rhai-registry = "0.2.1"
 gpui = { package = "gpui-pre", version = "=0.3.7", default-features = false, features = ["font-kit"] }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", default-features = false, features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 semver = "1"
