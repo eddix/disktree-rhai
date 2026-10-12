@@ -2575,7 +2575,9 @@ checksum = "829258540ea51bb9ea4a71686beffe5c99586901ba9f39944d06e4a180ab63fe"
 
 [[package]]
 name = "gpui-rhai"
-version = "0.1.8"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9ac2dbadeb37718172e106c0dfb75e888cb6f637c45fc0c6bbc4944e1c9a59c"
 dependencies = [
  "event-listener",
  "gpui-pre",
@@ -2600,7 +2602,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-rhai-registry"
-version = "0.1.8"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4846f7a1c95156aaa9d959ccf089a7d570e0d54aee9b8a074d4d68d1443bd26"
 
 [[package]]
 name = "half"
