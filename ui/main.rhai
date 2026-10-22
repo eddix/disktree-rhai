@@ -21,6 +21,7 @@ import "components/popover" as popover;
 import "components/progress" as progress;
 import "components/select" as select;
 import "components/spinner" as spinner;
+import "components/split_pane" as split_pane;
 import "components/status_bar" as status_bar;
 import "components/title_bar" as title_bar;
 import "components/toggle_group" as toggle_group;
@@ -44,7 +45,7 @@ define_component(#{
         dependencies: [
             "components/badge", "components/button", "components/checkbox",
             "components/divider", "components/kbd", "components/progress",
-            "components/popover", "components/select", "components/spinner",
+            "components/popover", "components/select", "components/spinner", "components/split_pane",
             "components/status_bar", "components/title_bar", "components/toggle_group",
             "layouts/inline", "layouts/toolbar", "patterns/description_list", "patterns/section",
             "patterns/stat",
@@ -115,20 +116,12 @@ define_component(#{
                     schema: #{ type: "integer", min: 0, max: 127 },
                     "default": #{ type: "integer", value: 0 },
                 },
+                panel_ratio: #{
+                    schema: #{ type: "number", min: 0.1, max: 0.9 },
+                    "default": #{ type: "float", value: 0.72 },
+                },
                 panel_width: #{
                     schema: #{ type: "number", min: 272.0, max: 704.0 },
-                    "default": #{ type: "float", value: 368.0 },
-                },
-                panel_dragging: #{
-                    schema: #{ type: "bool" },
-                    "default": #{ type: "bool", value: false },
-                },
-                panel_anchor_x: #{
-                    schema: #{ type: "number" },
-                    "default": #{ type: "float", value: 0.0 },
-                },
-                panel_anchor_w: #{
-                    schema: #{ type: "number" },
                     "default": #{ type: "float", value: 368.0 },
                 },
                 theme_open: #{
@@ -1067,10 +1060,6 @@ fn zoom_reset(ctx, payload) {
 /// the payload.
 fn on_key(ctx, name) {
     let scan = ctx.get_app_store("disktree", "scan");
-    if ctx.get_state("panel_dragging") && name == "escape" {
-        ctx.set_state("panel_dragging", false);
-        return ();
-    }
     if ctx.get_state("help_open") {
         if name == "escape" || name == "?" || name == "q" {
             ctx.set_state("help_open", false);
@@ -1831,80 +1820,13 @@ fn theme_query_changed(ctx, query) {
 
 /// The panel's grab strip: press to start a drag (double press resets to
 /// the default width), styled as an ink bar while it is held.
-fn panel_handle(dragging) {
-    let edge = theme_color("border");
-    if dragging {
-        edge = theme_color("accent");
-    }
-    box([])
-        .with_key("panel-handle")
-        .on("pointer_down", Fn("panel_drag_start"))
-        .on("pointer_move", Fn("panel_drag_over"))
-        .on("pointer_up", Fn("panel_drag_end"))
-        .accessibility_role("separator")
-        .accessibility_label("Resize the side panel")
-        .accessibility_orientation("vertical")
-        .with_style(
-            style()
-                .width(px(8.0))
-                .height(relative(1.0))
-                .flex_shrink(false)
-                .border_start(px(1.0))
-                .border_color(edge)
-                .cursor_resize_x()
-                .hover(style().background(theme_color("surface_hover")))
-        )
-}
 
-fn clamp_panel_width(width) {
-    let value = width;
-    if value < 272.0 {
-        value = 272.0;
-    }
-    if value > 704.0 {
-        value = 704.0;
-    }
-    value
-}
 
 /// Press on the edge: a double press resets to the default, like tobi's.
-fn panel_drag_start(ctx, event) {
-    if event.click_count >= 2 {
-        ctx.set_signal("panel-width", ());
-        ctx.set_state("panel_width", 368.0);
-        ctx.set_state("panel_dragging", false);
-        return ();
-    }
-    ctx.set_state("panel_dragging", true);
-    ctx.set_state("panel_anchor_x", event.window.x);
-    ctx.set_state("panel_anchor_w", ctx.get_state("panel_width"));
-}
 
 /// A move while held: the panel follows the pointer, between its limits.
-fn panel_drag_move(ctx, event) {
-    if !ctx.get_state("panel_dragging") {
-        return ();
-    }
-    let width = ctx.get_state("panel_anchor_w")
-        - (event.window.x - ctx.get_state("panel_anchor_x"));
-    // The signal drives the width natively; no Rhai re-render per pixel.
-    ctx.set_signal("panel-width", clamp_panel_width(width));
-}
 
-fn panel_drag_over(ctx, event) {
-    panel_drag_move(ctx, event);
-}
 
-fn panel_drag_end(ctx, event) {
-    if ctx.get_state("panel_dragging") {
-        let final_width = ctx.get_signal("panel-width");
-        if final_width != () {
-            ctx.set_state("panel_width", final_width);
-        }
-        ctx.set_signal("panel-width", ());
-        ctx.set_state("panel_dragging", false);
-    }
-}
 
 /// A theme switch re-colours the mosaic: the paint rows carry resolved
 /// colours, so the on-screen mode's paint is rebuilt for the new palette.
@@ -2057,34 +1979,30 @@ fn render_ScanRoot(ctx, props) {
     // and below 52rem of window it gives the mosaic its room, like tobi's.
     let viewport = ctx.viewport_class();
     let root_ref = element_ref("root");
-    // The drag signal: pointer moves update it natively (no Rhai re-render);
-    // only the release commits to state.
-    let panel_drag_w = optional_float_signal("panel-width");
     let with_side = body;
     if sidebar_open && layout.valid && viewport != "compact" {
         // The panel owns its left edge, hand-rolled: upstream's SplitPane
         // drops absolutely-positioned content in its panels since the
         // resize-grips rework (docs/UPSTREAM_GAPS.md G12) and the mosaic is
         // all absolute overlays. Drag the edge; double-click resets it.
-        with_side = row([
-            body.with_style(
-                style()
-                    .flex_grow()
-                    .width(relative(1.0))
-                    .min_width(px(0.0))
-            ),
-            panel_handle(ctx.get_state("panel_dragging")),
-            sidebar(
+        with_side = split_pane::SplitPane(#{
+            key: "main-split",
+            label: "Resize the side panel",
+            size: ctx.get_state("panel_ratio"),
+            start: body,
+            end: sidebar(
                 scan,
                 layout,
                 cursor,
                 mode,
                 ctx.get_app_store("disktree", "git"),
                 ctx.get_state("panel_width")
-            )
-            .bind_signal("width_override", panel_drag_w),
-        ])
-        .with_style(style().flex_row().width(relative(1.0)).flex_grow().min_height(px(0.0)));
+            ),
+            min_start: 360.0,
+            min_end: 272.0,
+            on_resize: Fn("panel_resized"),
+        })
+        .with_style(style().flex_grow());
     }
     let find = ctx.get_state("find");
     let body_rows = [
@@ -2788,9 +2706,7 @@ fn mosaic_nodes(layout, cursor, metric, scan, paint) {
                 .height(px(layout.height))
         )
         .on("pointer_move", Fn("on_pointer_move"))
-        .on("pointer_down", Fn("on_pointer_down"))
-        .on("pointer_move", Fn("panel_drag_move"))
-        .on("pointer_up", Fn("panel_drag_end"));
+        .on("pointer_down", Fn("on_pointer_down"));
     let rings = canvas(canvas_scene(ring_commands(layout, cursor)))
         .with_key("mosaic_rings")
         .with_style(
@@ -3770,4 +3686,16 @@ fn init(ctx) {
 
 fn view(ctx) {
     ScanRoot()
+}
+
+/// SplitPane proposed a new start ratio; store it clamped.
+fn panel_resized(ctx, ratio) {
+    let value = ratio;
+    if value < 0.1 {
+        value = 0.1;
+    }
+    if value > 0.9 {
+        value = 0.9;
+    }
+    ctx.set_state("panel_ratio", value);
 }
